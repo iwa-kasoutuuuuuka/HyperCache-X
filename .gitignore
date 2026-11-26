@@ -1,0 +1,28 @@
+# .NET build artifacts
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+TestResults/
+publish/
+
+# C/C++ / WDK driver build artifacts
+x64/
+ARM64/
+Debug/
+Release/
+*.sys
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.tlog
+*.log
+
+# HCX runtime metadata
+cache_metadata*.dat
+cache_metadata*.dat.tmp

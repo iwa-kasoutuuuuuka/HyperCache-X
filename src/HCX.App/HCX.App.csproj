@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\hcx.ico</ApplicationIcon>
+    <AssemblyName>HCX.App</AssemblyName>
+    <Version>2.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\HCX.Core\HCX.Core.csproj" />
+    <ProjectReference Include="..\HCX.VirtualFs\HCX.VirtualFs.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Management" Version="10.0.6" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\hcx.ico" />
+  </ItemGroup>
+</Project>

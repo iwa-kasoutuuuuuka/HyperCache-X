@@ -1,6 +1,8 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 namespace HCX.Core;
@@ -9,12 +11,27 @@ public sealed class SsdBlockMeta
 {
 	public required BlockKey Key { get; set; }
 	public int SlotIndex { get; init; }
+	public int KeyIndex { get; set; }
 	public int ValidLength { get; set; }
 	public bool IsDirty { get; set; }
 	public long BackingFileSize { get; set; }
 	public long BackingLastWriteUtcTicks { get; set; }
 	public DateTime LastAccessUtc { get; set; }
 	public double AiScore { get; set; }
+}
+
+internal sealed class SsdSlotEntry
+{
+	public required BlockKey Key;
+	public int SlotIndex;
+	public int KeyIndex;
+	public int ValidLength;
+	public bool IsDirty;
+	public long BackingFileSize;
+	public long BackingLastWriteUtcTicks;
+	public long LastAccessStamp;
+	public long LastAccessUtcTicks;
+	public double AiScore;
 }
 
 public sealed class EvictedSsdBlock
@@ -25,19 +42,25 @@ public sealed class EvictedSsdBlock
 }
 
 /// <summary>
-/// Safe Tier-2 SSD cache backed by a dedicated cache file (&lt;SsdDir&gt;\cache_{id}.bin) using RandomAccess.
-/// Never opens or writes raw physical volumes.
+/// Safe Tier-2 SSD cache backed by a dedicated cache file (&lt;SsdDir&gt;\cache_{id}.bin)
+/// with ReaderWriterLockSlim parallel reads, zero-alloc full-block writes, and O(1) dirty tracking.
 /// </summary>
 public sealed class SsdFileCacheTier : IDisposable
 {
-	private readonly object _sync = new object();
-	private readonly Dictionary<BlockKey, LinkedListNode<SsdBlockMeta>> _map = new Dictionary<BlockKey, LinkedListNode<SsdBlockMeta>>();
-	private readonly LinkedList<SsdBlockMeta> _lru = new LinkedList<SsdBlockMeta>();
+	private readonly ReaderWriterLockSlim _rwLock = new ReaderWriterLockSlim(LockRecursionPolicy.NoRecursion);
+	private readonly Dictionary<BlockKey, SsdSlotEntry> _map = new Dictionary<BlockKey, SsdSlotEntry>();
+	private readonly List<BlockKey> _keys = new List<BlockKey>();
+	private readonly Dictionary<string, HashSet<BlockKey>> _keysByFile = new Dictionary<string, HashSet<BlockKey>>(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, Dictionary<long, int>> _dirtyBlocksByFile = new Dictionary<string, Dictionary<long, int>>(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, long> _dirtyMaxEndByFile = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
 	private readonly Stack<int> _freeSlots = new Stack<int>();
+
 	private readonly SafeFileHandle? _handle;
 	private readonly int _blockSize;
 	private readonly int _maxSlots;
 	private int _nextSlotToAllocate;
+	private long _accessClock;
+	private int _evictCursor;
 	private int _dirtyCount;
 	private bool _disposed;
 
@@ -81,36 +104,59 @@ public sealed class SsdFileCacheTier : IDisposable
 			return false;
 		}
 
-		lock (_sync)
+		bool needsEvictStale = false;
+		_rwLock.EnterReadLock();
+		try
 		{
-			if (!_map.TryGetValue(key, out LinkedListNode<SsdBlockMeta>? node))
+			if (!_map.TryGetValue(key, out SsdSlotEntry? entry))
 			{
 				return false;
 			}
 
-			SsdBlockMeta entry = node.Value;
 			if (!entry.IsDirty &&
 			    (entry.BackingFileSize != currentBackingSize || entry.BackingLastWriteUtcTicks != currentBackingTicks))
 			{
-				RemoveNodeLocked(node);
-				invalidatedStale = true;
-				return false;
+				needsEvictStale = true;
 			}
-
-			long fileOffset = (long)entry.SlotIndex * _blockSize;
-			int totalRead = ReadExactLocked(fileOffset, destination64K.AsSpan(0, _blockSize));
-			if (totalRead < entry.ValidLength)
+			else
 			{
-				RemoveNodeLocked(node);
-				return false;
+				long fileOffset = (long)entry.SlotIndex * _blockSize;
+				int totalRead = ReadExactHandle(_handle, fileOffset, destination64K.AsSpan(0, _blockSize));
+				if (totalRead < entry.ValidLength)
+				{
+					needsEvictStale = true;
+				}
+				else
+				{
+					Volatile.Write(ref entry.LastAccessStamp, Interlocked.Increment(ref _accessClock));
+					Volatile.Write(ref entry.LastAccessUtcTicks, DateTime.UtcNow.Ticks);
+					meta = CloneMeta(entry);
+					return true;
+				}
 			}
-
-			_lru.Remove(node);
-			_lru.AddFirst(node);
-			entry.LastAccessUtc = DateTime.UtcNow;
-			meta = CloneMeta(entry);
-			return true;
 		}
+		finally
+		{
+			_rwLock.ExitReadLock();
+		}
+
+		if (needsEvictStale)
+		{
+			_rwLock.EnterWriteLock();
+			try
+			{
+				if (_map.TryGetValue(key, out SsdSlotEntry? stale))
+				{
+					RemoveEntryLocked(stale, pushFreeSlot: true);
+					invalidatedStale = true;
+				}
+			}
+			finally
+			{
+				_rwLock.ExitWriteLock();
+			}
+		}
+		return false;
 	}
 
 	public bool ContainsFresh(BlockKey key, long currentBackingSize, long currentBackingTicks)
@@ -119,11 +165,16 @@ public sealed class SsdFileCacheTier : IDisposable
 		{
 			return false;
 		}
-		lock (_sync)
+		_rwLock.EnterReadLock();
+		try
 		{
-			return _map.TryGetValue(key, out LinkedListNode<SsdBlockMeta>? node)
-				&& node.Value.BackingFileSize == currentBackingSize
-				&& node.Value.BackingLastWriteUtcTicks == currentBackingTicks;
+			return _map.TryGetValue(key, out SsdSlotEntry? entry)
+				&& entry.BackingFileSize == currentBackingSize
+				&& entry.BackingLastWriteUtcTicks == currentBackingTicks;
+		}
+		finally
+		{
+			_rwLock.ExitReadLock();
 		}
 	}
 
@@ -135,21 +186,25 @@ public sealed class SsdFileCacheTier : IDisposable
 			return false;
 		}
 
-		lock (_sync)
+		_rwLock.EnterReadLock();
+		try
 		{
-			if (!_map.TryGetValue(key, out LinkedListNode<SsdBlockMeta>? node))
+			if (!_map.TryGetValue(key, out SsdSlotEntry? entry))
 			{
 				return false;
 			}
-			SsdBlockMeta entry = node.Value;
 			long fileOffset = (long)entry.SlotIndex * _blockSize;
-			int read = ReadExactLocked(fileOffset, destination64K.AsSpan(0, _blockSize));
+			int read = ReadExactHandle(_handle, fileOffset, destination64K.AsSpan(0, _blockSize));
 			if (read < entry.ValidLength)
 			{
 				return false;
 			}
 			validLength = entry.ValidLength;
 			return true;
+		}
+		finally
+		{
+			_rwLock.ExitReadLock();
 		}
 	}
 
@@ -169,31 +224,24 @@ public sealed class SsdFileCacheTier : IDisposable
 			return false;
 		}
 
-		byte[] padded = new byte[_blockSize];
-		blockData.Slice(0, Math.Min(blockData.Length, _blockSize)).CopyTo(padded);
-
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			if (_map.TryGetValue(key, out LinkedListNode<SsdBlockMeta>? existing))
+			long stamp = Interlocked.Increment(ref _accessClock);
+			long utcTicks = DateTime.UtcNow.Ticks;
+
+			if (_map.TryGetValue(key, out SsdSlotEntry? existing))
 			{
-				SsdBlockMeta entry = existing.Value;
-				RandomAccess.Write(_handle, padded, (long)entry.SlotIndex * _blockSize);
-				entry.ValidLength = validLength;
-				if (!entry.IsDirty && isDirty)
-				{
-					_dirtyCount++;
-				}
-				else if (entry.IsDirty && !isDirty)
-				{
-					_dirtyCount = Math.Max(0, _dirtyCount - 1);
-				}
-				entry.IsDirty = isDirty;
-				entry.BackingFileSize = backingSize;
-				entry.BackingLastWriteUtcTicks = backingTicks;
-				entry.LastAccessUtc = DateTime.UtcNow;
-				entry.AiScore = aiScore;
-				_lru.Remove(existing);
-				_lru.AddFirst(existing);
+				WriteFullSlot(_handle, existing.SlotIndex, _blockSize, blockData);
+				bool wasDirty = existing.IsDirty;
+				existing.ValidLength = validLength;
+				existing.IsDirty = isDirty;
+				existing.BackingFileSize = backingSize;
+				existing.BackingLastWriteUtcTicks = backingTicks;
+				existing.LastAccessStamp = stamp;
+				existing.LastAccessUtcTicks = utcTicks;
+				existing.AiScore = aiScore;
+				UpdateDirtyIndexOnStateChangeLocked(key, wasDirty, isDirty, validLength);
 				return true;
 			}
 
@@ -206,52 +254,59 @@ public sealed class SsdFileCacheTier : IDisposable
 			{
 				slotIndex = _nextSlotToAllocate++;
 			}
-			else if (_lru.Last != null)
+			else
 			{
-				LinkedListNode<SsdBlockMeta> tail = _lru.Last;
-				SsdBlockMeta tailMeta = tail.Value;
-				slotIndex = tailMeta.SlotIndex;
+				SsdSlotEntry? victim = SelectVictimLocked();
+				if (victim == null)
+				{
+					return false;
+				}
+				slotIndex = victim.SlotIndex;
 
-				if (tailMeta.IsDirty)
+				if (victim.IsDirty)
 				{
 					byte[] oldData = new byte[_blockSize];
-					int oldRead = ReadExactLocked((long)slotIndex * _blockSize, oldData);
-					if (oldRead >= tailMeta.ValidLength)
+					int oldRead = ReadExactHandle(_handle, (long)slotIndex * _blockSize, oldData);
+					if (oldRead >= victim.ValidLength)
 					{
 						evictedDirty = new EvictedSsdBlock
 						{
-							Key = tailMeta.Key,
+							Key = victim.Key,
 							Data = oldData,
-							ValidLength = tailMeta.ValidLength
+							ValidLength = victim.ValidLength
 						};
 					}
 				}
-				RemoveNodeWithoutFreeLocked(tail);
-			}
-			else
-			{
-				return false;
+				RemoveEntryLocked(victim, pushFreeSlot: false);
 			}
 
-			RandomAccess.Write(_handle, padded, (long)slotIndex * _blockSize);
-			SsdBlockMeta created = new SsdBlockMeta
+			WriteFullSlot(_handle, slotIndex, _blockSize, blockData);
+			SsdSlotEntry created = new SsdSlotEntry
 			{
 				Key = key,
 				SlotIndex = slotIndex,
+				KeyIndex = _keys.Count,
 				ValidLength = validLength,
 				IsDirty = isDirty,
 				BackingFileSize = backingSize,
 				BackingLastWriteUtcTicks = backingTicks,
-				LastAccessUtc = DateTime.UtcNow,
+				LastAccessStamp = stamp,
+				LastAccessUtcTicks = utcTicks,
 				AiScore = aiScore
 			};
-			LinkedListNode<SsdBlockMeta> newNode = _lru.AddFirst(created);
-			_map[key] = newNode;
+			_keys.Add(key);
+			_map[key] = created;
+			AddFileKeyIndexLocked(key);
 			if (isDirty)
 			{
 				_dirtyCount++;
+				SetDirtyIndexLocked(key, validLength);
 			}
 			return true;
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
@@ -263,10 +318,14 @@ public sealed class SsdFileCacheTier : IDisposable
 		}
 
 		long fileLength = RandomAccess.GetLength(_handle);
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
 			_map.Clear();
-			_lru.Clear();
+			_keys.Clear();
+			_keysByFile.Clear();
+			_dirtyBlocksByFile.Clear();
+			_dirtyMaxEndByFile.Clear();
 			_freeSlots.Clear();
 			_dirtyCount = 0;
 			int maxSlotSeen = -1;
@@ -285,22 +344,26 @@ public sealed class SsdFileCacheTier : IDisposable
 				}
 
 				BlockKey key = new BlockKey(item.RelativePath, item.BlockIndex);
-				SsdBlockMeta meta = new SsdBlockMeta
+				SsdSlotEntry created = new SsdSlotEntry
 				{
 					Key = key,
 					SlotIndex = item.SlotIndex,
+					KeyIndex = _keys.Count,
 					ValidLength = Math.Clamp(item.ValidLength, 0, _blockSize),
 					IsDirty = item.IsDirty,
 					BackingFileSize = item.BackingFileSize,
 					BackingLastWriteUtcTicks = item.BackingLastWriteUtcTicks,
-					LastAccessUtc = new DateTime(item.LastAccessUtcTicks, DateTimeKind.Utc),
+					LastAccessStamp = Interlocked.Increment(ref _accessClock),
+					LastAccessUtcTicks = item.LastAccessUtcTicks,
 					AiScore = item.AiScore
 				};
-				LinkedListNode<SsdBlockMeta> node = _lru.AddLast(meta);
-				_map[key] = node;
-				if (meta.IsDirty)
+				_keys.Add(key);
+				_map[key] = created;
+				AddFileKeyIndexLocked(key);
+				if (created.IsDirty)
 				{
 					_dirtyCount++;
+					SetDirtyIndexLocked(key, created.ValidLength);
 				}
 				if (item.SlotIndex > maxSlotSeen)
 				{
@@ -317,89 +380,157 @@ public sealed class SsdFileCacheTier : IDisposable
 				}
 			}
 		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
+		}
 	}
 
 	public List<SsdBlockMeta> SnapshotEntries(string? filterRelativePath = null, bool dirtyOnly = false)
 	{
-		lock (_sync)
+		_rwLock.EnterReadLock();
+		try
 		{
 			List<SsdBlockMeta> result = new List<SsdBlockMeta>();
-			foreach (SsdBlockMeta e in _lru)
+			if (filterRelativePath != null)
 			{
-				if (dirtyOnly && !e.IsDirty)
+				if (dirtyOnly)
 				{
-					continue;
+					if (_dirtyBlocksByFile.TryGetValue(filterRelativePath, out Dictionary<long, int>? dirtyMap))
+					{
+						foreach (long blockIdx in dirtyMap.Keys)
+						{
+							if (_map.TryGetValue(new BlockKey(filterRelativePath, blockIdx), out SsdSlotEntry? e) && e.IsDirty)
+							{
+								result.Add(CloneMeta(e));
+							}
+						}
+					}
+					return result;
 				}
-				if (filterRelativePath != null &&
-				    !string.Equals(e.Key.RelativePath, filterRelativePath, StringComparison.OrdinalIgnoreCase))
+				if (_keysByFile.TryGetValue(filterRelativePath, out HashSet<BlockKey>? keys))
 				{
-					continue;
+					foreach (BlockKey k in keys)
+					{
+						if (_map.TryGetValue(k, out SsdSlotEntry? e))
+						{
+							result.Add(CloneMeta(e));
+						}
+					}
 				}
+				return result;
+			}
+
+			if (dirtyOnly)
+			{
+				foreach (KeyValuePair<string, Dictionary<long, int>> kv in _dirtyBlocksByFile)
+				{
+					foreach (long blockIdx in kv.Value.Keys)
+					{
+						if (_map.TryGetValue(new BlockKey(kv.Key, blockIdx), out SsdSlotEntry? e) && e.IsDirty)
+						{
+							result.Add(CloneMeta(e));
+						}
+					}
+				}
+				return result;
+			}
+
+			foreach (SsdSlotEntry e in _map.Values)
+			{
 				result.Add(CloneMeta(e));
 			}
 			return result;
+		}
+		finally
+		{
+			_rwLock.ExitReadLock();
 		}
 	}
 
 	public void MarkClean(BlockKey key, long newBackingSize, long newBackingTicks)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			if (_map.TryGetValue(key, out LinkedListNode<SsdBlockMeta>? node))
+			if (_map.TryGetValue(key, out SsdSlotEntry? e))
 			{
-				if (node.Value.IsDirty)
+				if (e.IsDirty)
 				{
-					node.Value.IsDirty = false;
+					e.IsDirty = false;
 					_dirtyCount = Math.Max(0, _dirtyCount - 1);
+					RemoveDirtyIndexLocked(key);
 				}
-				node.Value.BackingFileSize = newBackingSize;
-				node.Value.BackingLastWriteUtcTicks = newBackingTicks;
+				e.BackingFileSize = newBackingSize;
+				e.BackingLastWriteUtcTicks = newBackingTicks;
 			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void UpdateBackingMetadataForFile(string normalizedRelPath, long newBackingSize, long newBackingTicks)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			foreach (SsdBlockMeta e in _lru)
+			if (_keysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
 			{
-				if (!e.IsDirty && string.Equals(e.Key.RelativePath, normalizedRelPath, StringComparison.OrdinalIgnoreCase))
+				foreach (BlockKey k in keys)
 				{
-					e.BackingFileSize = newBackingSize;
-					e.BackingLastWriteUtcTicks = newBackingTicks;
+					if (_map.TryGetValue(k, out SsdSlotEntry? e) && !e.IsDirty)
+					{
+						e.BackingFileSize = newBackingSize;
+						e.BackingLastWriteUtcTicks = newBackingTicks;
+					}
 				}
 			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void Remove(BlockKey key)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			if (_map.TryGetValue(key, out LinkedListNode<SsdBlockMeta>? node))
+			if (_map.TryGetValue(key, out SsdSlotEntry? e))
 			{
-				RemoveNodeLocked(node);
+				RemoveEntryLocked(e, pushFreeSlot: true);
 			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void RemoveByFile(string normalizedRelPath)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			List<LinkedListNode<SsdBlockMeta>> toRemove = new List<LinkedListNode<SsdBlockMeta>>();
-			for (LinkedListNode<SsdBlockMeta>? n = _lru.First; n != null; n = n.Next)
+			if (!_keysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
 			{
-				if (string.Equals(n.Value.Key.RelativePath, normalizedRelPath, StringComparison.OrdinalIgnoreCase))
+				return;
+			}
+			List<BlockKey> toRemove = new List<BlockKey>(keys);
+			foreach (BlockKey k in toRemove)
+			{
+				if (_map.TryGetValue(k, out SsdSlotEntry? e))
 				{
-					toRemove.Add(n);
+					RemoveEntryLocked(e, pushFreeSlot: true);
 				}
 			}
-			foreach (LinkedListNode<SsdBlockMeta> n in toRemove)
-			{
-				RemoveNodeLocked(n);
-			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
@@ -409,90 +540,124 @@ public sealed class SsdFileCacheTier : IDisposable
 		{
 			return;
 		}
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			long lastValidBlock = newSize <= 0 ? -1 : (newSize - 1) / _blockSize;
-			List<LinkedListNode<SsdBlockMeta>> toRemove = new List<LinkedListNode<SsdBlockMeta>>();
-			for (LinkedListNode<SsdBlockMeta>? n = _lru.First; n != null; n = n.Next)
+			if (!_keysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
 			{
-				SsdBlockMeta e = n.Value;
-				if (!string.Equals(e.Key.RelativePath, normalizedRelPath, StringComparison.OrdinalIgnoreCase))
+				return;
+			}
+			long lastValidBlock = newSize <= 0 ? -1 : (newSize - 1) / _blockSize;
+			List<BlockKey> snapshot = new List<BlockKey>(keys);
+			foreach (BlockKey k in snapshot)
+			{
+				if (!_map.TryGetValue(k, out SsdSlotEntry? e))
 				{
 					continue;
 				}
-				if (e.Key.BlockIndex > lastValidBlock)
+				if (k.BlockIndex > lastValidBlock)
 				{
-					toRemove.Add(n);
+					RemoveEntryLocked(e, pushFreeSlot: true);
 				}
-				else if (e.Key.BlockIndex == lastValidBlock)
+				else if (k.BlockIndex == lastValidBlock)
 				{
 					int newValidLen = (int)(newSize - lastValidBlock * _blockSize);
 					if (newValidLen < e.ValidLength)
 					{
 						e.ValidLength = newValidLen;
+						if (e.IsDirty)
+						{
+							SetDirtyIndexLocked(k, newValidLen);
+						}
 					}
 				}
 			}
-			foreach (LinkedListNode<SsdBlockMeta> n in toRemove)
-			{
-				RemoveNodeLocked(n);
-			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void RenamePrefix(string oldRelPath, string newRelPath)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
 			string oldPrefix = oldRelPath.TrimEnd('\\') + "\\";
-			List<(LinkedListNode<SsdBlockMeta> Node, BlockKey NewKey)> renames = new List<(LinkedListNode<SsdBlockMeta>, BlockKey)>();
-			for (LinkedListNode<SsdBlockMeta>? n = _lru.First; n != null; n = n.Next)
+			List<(SsdSlotEntry Entry, BlockKey NewKey)> renames = new List<(SsdSlotEntry, BlockKey)>();
+			foreach (KeyValuePair<string, HashSet<BlockKey>> kv in _keysByFile)
 			{
-				BlockKey k = n.Value.Key;
-				if (string.Equals(k.RelativePath, oldRelPath, StringComparison.OrdinalIgnoreCase))
+				if (string.Equals(kv.Key, oldRelPath, StringComparison.OrdinalIgnoreCase) ||
+				    kv.Key.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
 				{
-					renames.Add((n, new BlockKey(newRelPath, k.BlockIndex)));
-				}
-				else if (k.RelativePath.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
-				{
-					string suffix = k.RelativePath.Substring(oldPrefix.Length);
-					renames.Add((n, new BlockKey(newRelPath.TrimEnd('\\') + "\\" + suffix, k.BlockIndex)));
+					foreach (BlockKey k in kv.Value)
+					{
+						if (!_map.TryGetValue(k, out SsdSlotEntry? e))
+						{
+							continue;
+						}
+						string nextPath = string.Equals(k.RelativePath, oldRelPath, StringComparison.OrdinalIgnoreCase)
+							? newRelPath
+							: newRelPath.TrimEnd('\\') + "\\" + k.RelativePath.Substring(oldPrefix.Length);
+						renames.Add((e, new BlockKey(nextPath, k.BlockIndex)));
+					}
 				}
 			}
-			foreach ((LinkedListNode<SsdBlockMeta> node, BlockKey newKey) in renames)
+
+			foreach ((SsdSlotEntry entry, BlockKey newKey) in renames)
 			{
-				_map.Remove(node.Value.Key);
-				node.Value.Key = newKey;
-				_map[newKey] = node;
+				BlockKey oldKey = entry.Key;
+				bool wasDirty = entry.IsDirty;
+				int validLen = entry.ValidLength;
+				int idx = entry.KeyIndex;
+
+				_map.Remove(oldKey);
+				RemoveFileKeyIndexLocked(oldKey);
+				if (wasDirty)
+				{
+					RemoveDirtyIndexLocked(oldKey);
+				}
+
+				entry.Key = newKey;
+				_keys[idx] = newKey;
+				_map[newKey] = entry;
+				AddFileKeyIndexLocked(newKey);
+				if (wasDirty)
+				{
+					SetDirtyIndexLocked(newKey, validLen);
+				}
 			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public long GetTrackedMaxFileSize(string normalizedRelPath)
 	{
-		lock (_sync)
+		_rwLock.EnterReadLock();
+		try
 		{
-			long maxEnd = 0;
-			foreach (SsdBlockMeta e in _lru)
-			{
-				if (e.IsDirty && string.Equals(e.Key.RelativePath, normalizedRelPath, StringComparison.OrdinalIgnoreCase))
-				{
-					long end = e.Key.BlockIndex * _blockSize + e.ValidLength;
-					if (end > maxEnd)
-					{
-						maxEnd = end;
-					}
-				}
-			}
-			return maxEnd;
+			return _dirtyMaxEndByFile.TryGetValue(normalizedRelPath, out long maxEnd) ? maxEnd : 0L;
+		}
+		finally
+		{
+			_rwLock.ExitReadLock();
 		}
 	}
 
 	public (int CachedBlocks, long UsedBytes, int DirtyBlocks) GetCounts()
 	{
-		lock (_sync)
+		_rwLock.EnterReadLock();
+		try
 		{
 			return (_map.Count, (long)_map.Count * _blockSize, _dirtyCount);
+		}
+		finally
+		{
+			_rwLock.ExitReadLock();
 		}
 	}
 
@@ -502,72 +667,209 @@ public sealed class SsdFileCacheTier : IDisposable
 		{
 			return;
 		}
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
 			RandomAccess.FlushToDisk(_handle);
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void Dispose()
 	{
-		lock (_sync)
+		if (_disposed)
 		{
-			if (_disposed)
-			{
-				return;
-			}
-			_disposed = true;
-			_handle?.Dispose();
+			return;
+		}
+		_disposed = true;
+		_handle?.Dispose();
+		_rwLock.Dispose();
+	}
+
+	private static void WriteFullSlot(SafeFileHandle handle, int slotIndex, int blockSize, ReadOnlySpan<byte> blockData)
+	{
+		long offset = (long)slotIndex * blockSize;
+		if (blockData.Length >= blockSize)
+		{
+			RandomAccess.Write(handle, blockData.Slice(0, blockSize), offset);
+			return;
+		}
+		byte[] rented = ArrayPool<byte>.Shared.Rent(blockSize);
+		try
+		{
+			blockData.CopyTo(rented);
+			Array.Clear(rented, blockData.Length, blockSize - blockData.Length);
+			RandomAccess.Write(handle, rented.AsSpan(0, blockSize), offset);
+		}
+		finally
+		{
+			ArrayPool<byte>.Shared.Return(rented);
 		}
 	}
 
-	private int ReadExactLocked(long offset, Span<byte> buffer)
+	private static int ReadExactHandle(SafeFileHandle handle, long offset, Span<byte> buffer)
 	{
-		if (_handle == null)
-		{
-			return 0;
-		}
 		int total = 0;
 		while (total < buffer.Length)
 		{
-			int n = RandomAccess.Read(_handle, buffer.Slice(total), offset + total);
-			if (n <= 0)
-			{
-				break;
-			}
+			int n = RandomAccess.Read(handle, buffer.Slice(total), offset + total);
+			if (n <= 0) break;
 			total += n;
 		}
 		return total;
 	}
 
-	private void RemoveNodeLocked(LinkedListNode<SsdBlockMeta> node)
+	private SsdSlotEntry? SelectVictimLocked()
 	{
-		int slot = node.Value.SlotIndex;
-		RemoveNodeWithoutFreeLocked(node);
-		_freeSlots.Push(slot);
+		int count = _keys.Count;
+		if (count == 0) return null;
+
+		int samples = count <= 64 ? count : 32;
+		int stride = count <= 64 ? 1 : Math.Max(1, count / samples);
+		SsdSlotEntry? oldest = null;
+		long oldestStamp = long.MaxValue;
+		int start = count <= 64 ? 0 : (_evictCursor % count);
+		for (int i = 0; i < samples; i++)
+		{
+			int idx = (start + i * stride) % count;
+			SsdSlotEntry candidate = _map[_keys[idx]];
+			long stamp = Volatile.Read(ref candidate.LastAccessStamp);
+			if (stamp < oldestStamp)
+			{
+				oldestStamp = stamp;
+				oldest = candidate;
+			}
+		}
+		_evictCursor = (start + 1) % Math.Max(1, count);
+		return oldest;
 	}
 
-	private void RemoveNodeWithoutFreeLocked(LinkedListNode<SsdBlockMeta> node)
+	private void RemoveEntryLocked(SsdSlotEntry e, bool pushFreeSlot)
 	{
-		if (node.Value.IsDirty)
+		int slot = e.SlotIndex;
+		if (e.IsDirty)
 		{
 			_dirtyCount = Math.Max(0, _dirtyCount - 1);
+			RemoveDirtyIndexLocked(e.Key);
 		}
-		_map.Remove(node.Value.Key);
-		_lru.Remove(node);
+		_map.Remove(e.Key);
+		RemoveFileKeyIndexLocked(e.Key);
+
+		int idx = e.KeyIndex;
+		int last = _keys.Count - 1;
+		if (idx < last)
+		{
+			BlockKey moved = _keys[last];
+			_keys[idx] = moved;
+			_map[moved].KeyIndex = idx;
+		}
+		_keys.RemoveAt(last);
+		if (pushFreeSlot)
+		{
+			_freeSlots.Push(slot);
+		}
 	}
 
-	private static SsdBlockMeta CloneMeta(SsdBlockMeta src)
+	private void AddFileKeyIndexLocked(BlockKey key)
+	{
+		if (!_keysByFile.TryGetValue(key.RelativePath, out HashSet<BlockKey>? set))
+		{
+			set = new HashSet<BlockKey>();
+			_keysByFile[key.RelativePath] = set;
+		}
+		set.Add(key);
+	}
+
+	private void RemoveFileKeyIndexLocked(BlockKey key)
+	{
+		if (_keysByFile.TryGetValue(key.RelativePath, out HashSet<BlockKey>? set))
+		{
+			set.Remove(key);
+			if (set.Count == 0)
+			{
+				_keysByFile.Remove(key.RelativePath);
+			}
+		}
+	}
+
+	private void UpdateDirtyIndexOnStateChangeLocked(BlockKey key, bool wasDirty, bool isNowDirty, int validLen)
+	{
+		if (!wasDirty && isNowDirty)
+		{
+			_dirtyCount++;
+			SetDirtyIndexLocked(key, validLen);
+		}
+		else if (wasDirty && !isNowDirty)
+		{
+			_dirtyCount = Math.Max(0, _dirtyCount - 1);
+			RemoveDirtyIndexLocked(key);
+		}
+		else if (isNowDirty)
+		{
+			SetDirtyIndexLocked(key, validLen);
+		}
+	}
+
+	private void SetDirtyIndexLocked(BlockKey key, int validLen)
+	{
+		if (!_dirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map))
+		{
+			map = new Dictionary<long, int>();
+			_dirtyBlocksByFile[key.RelativePath] = map;
+		}
+		map[key.BlockIndex] = validLen;
+		long end = key.BlockIndex * _blockSize + validLen;
+		if (!_dirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) || end > curMax)
+		{
+			_dirtyMaxEndByFile[key.RelativePath] = end;
+		}
+		else
+		{
+			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
+		}
+	}
+
+	private void RemoveDirtyIndexLocked(BlockKey key)
+	{
+		if (!_dirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map)) return;
+		map.Remove(key.BlockIndex);
+		if (map.Count == 0)
+		{
+			_dirtyBlocksByFile.Remove(key.RelativePath);
+			_dirtyMaxEndByFile.Remove(key.RelativePath);
+		}
+		else
+		{
+			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
+		}
+	}
+
+	private void RecomputeDirtyMaxEndLocked(string relPath, Dictionary<long, int> map)
+	{
+		long max = 0;
+		foreach (KeyValuePair<long, int> kv in map)
+		{
+			long end = kv.Key * _blockSize + kv.Value;
+			if (end > max) max = end;
+		}
+		_dirtyMaxEndByFile[relPath] = max;
+	}
+
+	private static SsdBlockMeta CloneMeta(SsdSlotEntry src)
 	{
 		return new SsdBlockMeta
 		{
 			Key = src.Key,
 			SlotIndex = src.SlotIndex,
+			KeyIndex = src.KeyIndex,
 			ValidLength = src.ValidLength,
 			IsDirty = src.IsDirty,
 			BackingFileSize = src.BackingFileSize,
 			BackingLastWriteUtcTicks = src.BackingLastWriteUtcTicks,
-			LastAccessUtc = src.LastAccessUtc,
+			LastAccessUtc = new DateTime(Volatile.Read(ref src.LastAccessUtcTicks), DateTimeKind.Utc),
 			AiScore = src.AiScore
 		};
 	}

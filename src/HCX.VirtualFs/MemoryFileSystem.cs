@@ -180,25 +180,21 @@ public sealed class MemoryFileSystem : FileSystemBase
 		out uint bytesTransferred)
 	{
 		MemDesc desc = (MemDesc)fileDescObj;
-		byte[] rented = ArrayPool<byte>.Shared.Rent((int)Math.Max(1u, length));
-		try
+		if (length > (uint)int.MaxValue)
 		{
-			int read = _store.ReadFile(desc.Path, offset, rented.AsSpan(0, (int)length), out bool eof);
+			length = int.MaxValue;
+		}
+		unsafe
+		{
+			Span<byte> dest = new Span<byte>(buffer.ToPointer(), (int)length);
+			int read = _store.ReadFile(desc.Path, offset, dest, out bool eof);
 			if (eof)
 			{
 				bytesTransferred = 0;
 				return STATUS_END_OF_FILE;
 			}
-			if (read > 0)
-			{
-				Marshal.Copy(rented, 0, buffer, read);
-			}
 			bytesTransferred = (uint)read;
 			return STATUS_SUCCESS;
-		}
-		finally
-		{
-			ArrayPool<byte>.Shared.Return(rented);
 		}
 	}
 
@@ -214,20 +210,16 @@ public sealed class MemoryFileSystem : FileSystemBase
 		out FileInfo fileInfo)
 	{
 		MemDesc desc = (MemDesc)fileDescObj;
-		byte[] rented = ArrayPool<byte>.Shared.Rent((int)Math.Max(1u, length));
-		try
+		if (length > (uint)int.MaxValue)
 		{
-			if (length > 0)
-			{
-				Marshal.Copy(buffer, rented, 0, (int)length);
-			}
-			InMemoryFileInfo info = _store.WriteFile(desc.Path, offset, rented.AsSpan(0, (int)length), writeToEndOfFile, constrainedIo, out bytesTransferred);
+			length = int.MaxValue;
+		}
+		unsafe
+		{
+			ReadOnlySpan<byte> src = new ReadOnlySpan<byte>(buffer.ToPointer(), (int)length);
+			InMemoryFileInfo info = _store.WriteFile(desc.Path, offset, src, writeToEndOfFile, constrainedIo, out bytesTransferred);
 			fileInfo = ConvertInfo(info);
 			return STATUS_SUCCESS;
-		}
-		finally
-		{
-			ArrayPool<byte>.Shared.Return(rented);
 		}
 	}
 

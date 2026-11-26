@@ -38,6 +38,8 @@ public sealed class CacheOptions
 
 	public TimeSpan AutoSaveInterval { get; set; } = TimeSpan.FromSeconds(10);
 
+	public TimeSpan BackingStatCacheTtl { get; set; } = TimeSpan.FromMilliseconds(500);
+
 	public int SequentialThreshold { get; set; } = 8;
 
 	public double SsdPromoteScore { get; set; } = 1.2;

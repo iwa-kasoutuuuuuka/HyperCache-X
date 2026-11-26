@@ -238,7 +238,8 @@ public sealed class HybridCacheEngineTests : IDisposable
 			SsdCacheDirectory = _ssdDir,
 			RamCacheSizeBytes = 2 * blockSize,
 			SsdCacheSizeBytes = 2 * blockSize,
-			RamPromoteScore = 1.0
+			RamPromoteScore = 1.0,
+			BackingStatCacheTtl = TimeSpan.Zero
 		};
 
 		using HybridCacheEngine engine = new HybridCacheEngine(opts);

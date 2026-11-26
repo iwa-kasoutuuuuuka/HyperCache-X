@@ -3,6 +3,7 @@
     <TargetFramework>net10.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>HCX.VirtualFs</AssemblyName>
     <Version>2.0.0</Version>
   </PropertyGroup>

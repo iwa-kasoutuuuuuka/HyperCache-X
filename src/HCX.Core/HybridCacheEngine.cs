@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -16,6 +17,16 @@ namespace HCX.Core;
 /// </summary>
 public sealed class HybridCacheEngine : IDisposable
 {
+	private readonly struct CachedBackingStat
+	{
+		public bool Exists { get; init; }
+		public long Size { get; init; }
+		public long LastWriteUtcTicks { get; init; }
+		public long CachedAtTimestamp { get; init; }
+	}
+
+	private const int MaxCoalescedFlushBlocks = 16; // 1 MB per coalesced write
+
 	private readonly CacheOptions _options;
 	private readonly string _targetRootFull;
 	private readonly string _instanceId;
@@ -24,7 +35,9 @@ public sealed class HybridCacheEngine : IDisposable
 	private readonly IL1CacheTier _ram;
 	private readonly SsdFileCacheTier _ssd;
 	private readonly MetadataManager _metadata;
-	private readonly ConcurrentDictionary<string, object> _fileLocks = new ConcurrentDictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+	private readonly ConcurrentDictionary<string, ReaderWriterLockSlim> _fileLocks = new ConcurrentDictionary<string, ReaderWriterLockSlim>(StringComparer.OrdinalIgnoreCase);
+	private readonly ConcurrentDictionary<string, CachedBackingStat> _statCache = new ConcurrentDictionary<string, CachedBackingStat>(StringComparer.OrdinalIgnoreCase);
+	private readonly long _statTtlStopwatchTicks;
 
 	private CancellationTokenSource? _cts;
 	private Task? _flushTask;
@@ -72,6 +85,9 @@ public sealed class HybridCacheEngine : IDisposable
 			? ssdDir
 			: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HyperCacheX");
 		_metadata = new MetadataManager(Path.Combine(metaDir, $"cache_metadata_{_instanceId}.dat"));
+		_statTtlStopwatchTicks = _options.BackingStatCacheTtl <= TimeSpan.Zero
+			? 0L
+			: (long)(_options.BackingStatCacheTtl.TotalSeconds * Stopwatch.Frequency);
 	}
 
 	public bool Start()
@@ -123,6 +139,12 @@ public sealed class HybridCacheEngine : IDisposable
 		}
 	}
 
+	public void InvalidateBackingStatCache(string relativePath)
+	{
+		string rel = BlockKey.NormalizeRelativePath(relativePath);
+		_statCache.TryRemove(rel, out _);
+	}
+
 	public int ReadBlockRange(string relativePath, long offset, Span<byte> destination, FileStream? openBackingStream = null)
 	{
 		if (offset < 0 || destination.IsEmpty)
@@ -132,11 +154,13 @@ public sealed class HybridCacheEngine : IDisposable
 
 		string rel = BlockKey.NormalizeRelativePath(relativePath);
 		string fullPath = ResolveBackingPath(rel);
-		object fileLock = GetFileLock(rel);
+		ReaderWriterLockSlim fileLock = GetFileLock(rel);
 
-		lock (fileLock)
+		fileLock.EnterReadLock();
+		byte[]? rentedBlockBuf = null;
+		try
 		{
-			(bool exists, long backingSize, long backingTicks) = GetBackingInfoLocked(fullPath, openBackingStream);
+			(bool exists, long backingSize, long backingTicks) = GetBackingInfoFast(rel, fullPath, openBackingStream);
 			long effectiveSize = Math.Max(backingSize, Math.Max(_ram.GetTrackedMaxFileSize(rel), _ssd.GetTrackedMaxFileSize(rel)));
 			if ((!exists && effectiveSize == 0) || offset >= effectiveSize)
 			{
@@ -145,7 +169,7 @@ public sealed class HybridCacheEngine : IDisposable
 
 			int toRead = (int)Math.Min(destination.Length, effectiveSize - offset);
 			int bytesReadTotal = 0;
-			byte[] blockBuf = new byte[_blockSize];
+			DateTime nowUtc = DateTime.UtcNow;
 
 			while (bytesReadTotal < toRead)
 			{
@@ -154,8 +178,6 @@ public sealed class HybridCacheEngine : IDisposable
 				int blockOffset = (int)(pos % _blockSize);
 				int chunk = Math.Min(toRead - bytesReadTotal, _blockSize - blockOffset);
 				BlockKey key = new BlockKey(rel, blockIndex);
-
-				ScoreDecision decision = _scorer.RecordAccess(key, isWrite: false, DateTime.UtcNow);
 				Span<byte> destSlice = destination.Slice(bytesReadTotal, chunk);
 
 				if (_ram.TryReadSlice(key, blockOffset, destSlice, backingSize, backingTicks, out int ramCopied, out bool ramDirty, out bool ramStale))
@@ -165,7 +187,7 @@ public sealed class HybridCacheEngine : IDisposable
 						destSlice.Slice(ramCopied).Clear();
 					}
 					Interlocked.Increment(ref _ramHits);
-					_scorer.UpdateTierState(key, CacheTier.RamL1, ramDirty, decision.Score);
+					_scorer.RecordAccess(key, isWrite: false, nowUtc, CacheTier.RamL1, ramDirty);
 					bytesReadTotal += chunk;
 					continue;
 				}
@@ -174,16 +196,19 @@ public sealed class HybridCacheEngine : IDisposable
 					_scorer.UpdateTierState(key, CacheTier.None, false);
 				}
 
-				Array.Clear(blockBuf, 0, _blockSize);
-				if (_ssd.TryReadFullBlock(key, blockBuf, backingSize, backingTicks, out SsdBlockMeta? ssdMeta, out bool ssdStale) && ssdMeta != null)
+				ScoreDecision decision = _scorer.RecordAccess(key, isWrite: false, nowUtc);
+				rentedBlockBuf ??= ArrayPool<byte>.Shared.Rent(_blockSize);
+				Array.Clear(rentedBlockBuf, 0, _blockSize);
+
+				if (_ssd.TryReadFullBlock(key, rentedBlockBuf, backingSize, backingTicks, out SsdBlockMeta? ssdMeta, out bool ssdStale) && ssdMeta != null)
 				{
-					blockBuf.AsSpan(blockOffset, chunk).CopyTo(destSlice);
+					rentedBlockBuf.AsSpan(blockOffset, chunk).CopyTo(destSlice);
 					Interlocked.Increment(ref _ssdHits);
 
 					// Keep dirty ownership single-place: only promote clean L2 blocks into L1 RAM.
 					if (!ssdMeta.IsDirty && _ram.IsEnabled && decision.ShouldPromoteToRam)
 					{
-						PutInRamWithDemotionLocked(key, blockBuf, ssdMeta.ValidLength, isDirty: false, backingSize, backingTicks, decision.Score);
+						PutInRamWithDemotionLocked(key, rentedBlockBuf, ssdMeta.ValidLength, isDirty: false, backingSize, backingTicks, decision.Score);
 						_scorer.UpdateTierState(key, CacheTier.RamL1, false, decision.Score);
 					}
 					else
@@ -200,24 +225,24 @@ public sealed class HybridCacheEngine : IDisposable
 				}
 
 				// Tier 3: Backing HDD read
-				Array.Clear(blockBuf, 0, _blockSize);
+				Array.Clear(rentedBlockBuf, 0, _blockSize);
 				int validLen = 0;
 				if (exists && blockIndex * _blockSize < backingSize)
 				{
-					validLen = ReadBackingBlockLocked(fullPath, openBackingStream, blockIndex * _blockSize, blockBuf);
+					validLen = ReadBackingBlockLocked(fullPath, openBackingStream, blockIndex * _blockSize, rentedBlockBuf.AsSpan(0, _blockSize));
 				}
-				blockBuf.AsSpan(blockOffset, chunk).CopyTo(destSlice);
+				rentedBlockBuf.AsSpan(blockOffset, chunk).CopyTo(destSlice);
 				Interlocked.Increment(ref _hddMisses);
 
 				if (!decision.IsSequentialBypass && validLen > 0)
 				{
 					if (_ram.IsEnabled && decision.ShouldPromoteToRam)
 					{
-						PutInRamWithDemotionLocked(key, blockBuf, validLen, isDirty: false, backingSize, backingTicks, decision.Score);
+						PutInRamWithDemotionLocked(key, rentedBlockBuf, validLen, isDirty: false, backingSize, backingTicks, decision.Score);
 					}
 					else if (_ssd.IsEnabled && decision.ShouldPromoteToSsd)
 					{
-						PutInSsdWithEvictionFlushLocked(key, blockBuf, validLen, isDirty: false, backingSize, backingTicks, decision.Score, fullPath, openBackingStream);
+						PutInSsdWithEvictionFlushLocked(key, rentedBlockBuf, validLen, isDirty: false, backingSize, backingTicks, decision.Score, fullPath, openBackingStream);
 					}
 				}
 
@@ -226,6 +251,14 @@ public sealed class HybridCacheEngine : IDisposable
 
 			Interlocked.Add(ref _totalReadBytes, bytesReadTotal);
 			return bytesReadTotal;
+		}
+		finally
+		{
+			if (rentedBlockBuf != null)
+			{
+				ArrayPool<byte>.Shared.Return(rentedBlockBuf);
+			}
+			fileLock.ExitReadLock();
 		}
 	}
 
@@ -242,21 +275,23 @@ public sealed class HybridCacheEngine : IDisposable
 
 		string rel = BlockKey.NormalizeRelativePath(relativePath);
 		string fullPath = ResolveBackingPath(rel);
-		object fileLock = GetFileLock(rel);
+		ReaderWriterLockSlim fileLock = GetFileLock(rel);
 
-		lock (fileLock)
+		fileLock.EnterWriteLock();
+		byte[]? rentedWorkBuf = null;
+		try
 		{
 			Interlocked.Add(ref _totalWriteBytes, source.Length);
+			DateTime nowUtc = DateTime.UtcNow;
 
 			bool useWriteBack = _options.WritePolicy == WritePolicy.WriteBack && (_ram.IsEnabled || _ssd.IsEnabled);
 			if (!useWriteBack)
 			{
 				WriteBackingRangeLocked(fullPath, openBackingStream, offset, source);
-				(bool _, long newSize, long newTicks) = GetBackingInfoLocked(fullPath, openBackingStream);
+				(bool _, long newSize, long newTicks) = RefreshBackingInfoLocked(rel, fullPath, openBackingStream);
 				_ram.UpdateBackingMetadataForFile(rel, newSize, newTicks);
 				_ssd.UpdateBackingMetadataForFile(rel, newSize, newTicks);
 
-				byte[] blockBuf = new byte[_blockSize];
 				int written = 0;
 				while (written < source.Length)
 				{
@@ -265,7 +300,7 @@ public sealed class HybridCacheEngine : IDisposable
 					int blockOffset = (int)(pos % _blockSize);
 					int chunk = Math.Min(source.Length - written, _blockSize - blockOffset);
 					BlockKey key = new BlockKey(rel, blockIndex);
-					ScoreDecision decision = _scorer.RecordAccess(key, isWrite: true, DateTime.UtcNow);
+					ScoreDecision decision = _scorer.RecordAccess(key, isWrite: true, nowUtc);
 					ReadOnlySpan<byte> patch = source.Slice(written, chunk);
 
 					bool inRam = _ram.TryPatchOrGetForWrite(key, blockOffset, patch, newSize, newTicks, decision.Score, markDirty: false);
@@ -279,17 +314,18 @@ public sealed class HybridCacheEngine : IDisposable
 						_ssd.Remove(key);
 						if (!decision.IsSequentialBypass && (decision.ShouldPromoteToRam || decision.ShouldPromoteToSsd))
 						{
-							Array.Clear(blockBuf, 0, _blockSize);
-							int validLen = ReadBackingBlockLocked(fullPath, openBackingStream, blockIndex * _blockSize, blockBuf);
+							rentedWorkBuf ??= ArrayPool<byte>.Shared.Rent(_blockSize);
+							Array.Clear(rentedWorkBuf, 0, _blockSize);
+							int validLen = ReadBackingBlockLocked(fullPath, openBackingStream, blockIndex * _blockSize, rentedWorkBuf.AsSpan(0, _blockSize));
 							if (validLen > 0)
 							{
 								if (_ram.IsEnabled && decision.ShouldPromoteToRam)
 								{
-									PutInRamWithDemotionLocked(key, blockBuf, validLen, isDirty: false, newSize, newTicks, decision.Score);
+									PutInRamWithDemotionLocked(key, rentedWorkBuf, validLen, isDirty: false, newSize, newTicks, decision.Score);
 								}
 								else if (_ssd.IsEnabled && decision.ShouldPromoteToSsd)
 								{
-									PutInSsdWithEvictionFlushLocked(key, blockBuf, validLen, isDirty: false, newSize, newTicks, decision.Score, fullPath, openBackingStream);
+									PutInSsdWithEvictionFlushLocked(key, rentedWorkBuf, validLen, isDirty: false, newSize, newTicks, decision.Score, fullPath, openBackingStream);
 								}
 							}
 						}
@@ -304,8 +340,7 @@ public sealed class HybridCacheEngine : IDisposable
 			}
 
 			// Write-Back mode
-			(bool exists, long backingSize, long backingTicks) = GetBackingInfoLocked(fullPath, openBackingStream);
-			byte[] workBuf = new byte[_blockSize];
+			(bool exists, long backingSize, long backingTicks) = GetBackingInfoFast(rel, fullPath, openBackingStream);
 			int totalWritten = 0;
 
 			while (totalWritten < source.Length)
@@ -315,7 +350,7 @@ public sealed class HybridCacheEngine : IDisposable
 				int blockOffset = (int)(pos % _blockSize);
 				int chunk = Math.Min(source.Length - totalWritten, _blockSize - blockOffset);
 				BlockKey key = new BlockKey(rel, blockIndex);
-				ScoreDecision decision = _scorer.RecordAccess(key, isWrite: true, DateTime.UtcNow);
+				ScoreDecision decision = _scorer.RecordAccess(key, isWrite: true, nowUtc);
 				ReadOnlySpan<byte> patch = source.Slice(totalWritten, chunk);
 
 				if (_ram.TryPatchOrGetForWrite(key, blockOffset, patch, backingSize, backingTicks, decision.Score, markDirty: true))
@@ -326,39 +361,42 @@ public sealed class HybridCacheEngine : IDisposable
 					continue;
 				}
 
-				Array.Clear(workBuf, 0, _blockSize);
+				rentedWorkBuf ??= ArrayPool<byte>.Shared.Rent(_blockSize);
+				Array.Clear(rentedWorkBuf, 0, _blockSize);
 				int existingValidLen = 0;
 				bool isPartial = blockOffset > 0 || chunk < _blockSize;
 				if (isPartial)
 				{
-					if (_ssd.TryReadFullBlock(key, workBuf, backingSize, backingTicks, out SsdBlockMeta? ssdMeta, out _) && ssdMeta != null)
+					if (_ssd.TryReadFullBlock(key, rentedWorkBuf, backingSize, backingTicks, out SsdBlockMeta? ssdMeta, out _) && ssdMeta != null)
 					{
 						existingValidLen = ssdMeta.ValidLength;
 					}
 					else if (exists && blockIndex * _blockSize < backingSize)
 					{
-						existingValidLen = ReadBackingBlockLocked(fullPath, openBackingStream, blockIndex * _blockSize, workBuf);
+						existingValidLen = ReadBackingBlockLocked(fullPath, openBackingStream, blockIndex * _blockSize, rentedWorkBuf.AsSpan(0, _blockSize));
 					}
 				}
 
-				patch.CopyTo(workBuf.AsSpan(blockOffset, chunk));
+				patch.CopyTo(rentedWorkBuf.AsSpan(blockOffset, chunk));
 				int newValidLen = Math.Max(existingValidLen, blockOffset + chunk);
 
 				if (_ram.IsEnabled)
 				{
 					_ssd.Remove(key);
-					PutInRamWithDemotionLocked(key, workBuf, newValidLen, isDirty: true, backingSize, backingTicks, decision.Score);
+					PutInRamWithDemotionLocked(key, rentedWorkBuf, newValidLen, isDirty: true, backingSize, backingTicks, decision.Score);
 				}
 				else if (_ssd.IsEnabled)
 				{
-					if (!PutInSsdWithEvictionFlushLocked(key, workBuf, newValidLen, isDirty: true, backingSize, backingTicks, decision.Score, fullPath, openBackingStream))
+					if (!PutInSsdWithEvictionFlushLocked(key, rentedWorkBuf, newValidLen, isDirty: true, backingSize, backingTicks, decision.Score, fullPath, openBackingStream))
 					{
 						WriteBackingRangeLocked(fullPath, openBackingStream, pos, patch);
+						_statCache.TryRemove(rel, out _);
 					}
 				}
 				else
 				{
 					WriteBackingRangeLocked(fullPath, openBackingStream, pos, patch);
+					_statCache.TryRemove(rel, out _);
 				}
 
 				totalWritten += chunk;
@@ -366,16 +404,30 @@ public sealed class HybridCacheEngine : IDisposable
 
 			return totalWritten;
 		}
+		finally
+		{
+			if (rentedWorkBuf != null)
+			{
+				ArrayPool<byte>.Shared.Return(rentedWorkBuf);
+			}
+			fileLock.ExitWriteLock();
+		}
 	}
 
 	public long GetEffectiveFileSize(string relativePath, FileStream? openBackingStream = null)
 	{
 		string rel = BlockKey.NormalizeRelativePath(relativePath);
 		string fullPath = ResolveBackingPath(rel);
-		lock (GetFileLock(rel))
+		ReaderWriterLockSlim fileLock = GetFileLock(rel);
+		fileLock.EnterReadLock();
+		try
 		{
-			(_, long backingSize, _) = GetBackingInfoLocked(fullPath, openBackingStream);
+			(_, long backingSize, _) = GetBackingInfoFast(rel, fullPath, openBackingStream);
 			return Math.Max(backingSize, Math.Max(_ram.GetTrackedMaxFileSize(rel), _ssd.GetTrackedMaxFileSize(rel)));
+		}
+		finally
+		{
+			fileLock.ExitReadLock();
 		}
 	}
 
@@ -383,20 +435,33 @@ public sealed class HybridCacheEngine : IDisposable
 	{
 		string rel = BlockKey.NormalizeRelativePath(relativePath);
 		string fullPath = ResolveBackingPath(rel);
-		lock (GetFileLock(rel))
+		ReaderWriterLockSlim fileLock = GetFileLock(rel);
+		fileLock.EnterWriteLock();
+		try
 		{
 			return FlushFileLocked(rel, fullPath, openBackingStream);
+		}
+		finally
+		{
+			fileLock.ExitWriteLock();
 		}
 	}
 
 	public void InvalidateFile(string relativePath)
 	{
 		string rel = BlockKey.NormalizeRelativePath(relativePath);
-		lock (GetFileLock(rel))
+		ReaderWriterLockSlim fileLock = GetFileLock(rel);
+		fileLock.EnterWriteLock();
+		try
 		{
 			_ram.RemoveByFile(rel);
 			_ssd.RemoveByFile(rel);
 			_scorer.RemoveByFile(rel);
+			_statCache.TryRemove(rel, out _);
+		}
+		finally
+		{
+			fileLock.ExitWriteLock();
 		}
 	}
 
@@ -404,14 +469,19 @@ public sealed class HybridCacheEngine : IDisposable
 	{
 		string rel = BlockKey.NormalizeRelativePath(relativePath);
 		string fullPath = ResolveBackingPath(rel);
-		lock (GetFileLock(rel))
+		ReaderWriterLockSlim fileLock = GetFileLock(rel);
+		fileLock.EnterWriteLock();
+		try
 		{
-			// Flush dirty blocks within newSize first or truncate cache directly, then update metadata.
 			_ram.TruncateFile(rel, newSize);
 			_ssd.TruncateFile(rel, newSize);
-			(bool _, long backingSize, long backingTicks) = GetBackingInfoLocked(fullPath, null);
+			(bool _, long backingSize, long backingTicks) = RefreshBackingInfoLocked(rel, fullPath, null);
 			_ram.UpdateBackingMetadataForFile(rel, backingSize, backingTicks);
 			_ssd.UpdateBackingMetadataForFile(rel, backingSize, backingTicks);
+		}
+		finally
+		{
+			fileLock.ExitWriteLock();
 		}
 	}
 
@@ -421,26 +491,45 @@ public sealed class HybridCacheEngine : IDisposable
 		string newRel = BlockKey.NormalizeRelativePath(newRelativePath);
 		if (string.Equals(oldRel, newRel, StringComparison.OrdinalIgnoreCase))
 		{
-			lock (GetFileLock(oldRel))
+			ReaderWriterLockSlim singleLock = GetFileLock(oldRel);
+			singleLock.EnterWriteLock();
+			try
 			{
 				_ram.RenamePrefix(oldRel, newRel);
 				_ssd.RenamePrefix(oldRel, newRel);
 				_scorer.RenamePrefix(oldRel, newRel);
+				_statCache.TryRemove(oldRel, out _);
+			}
+			finally
+			{
+				singleLock.ExitWriteLock();
 			}
 			return;
 		}
 
 		bool oldFirst = StringComparer.OrdinalIgnoreCase.Compare(oldRel, newRel) < 0;
-		object firstLock = GetFileLock(oldFirst ? oldRel : newRel);
-		object secondLock = GetFileLock(oldFirst ? newRel : oldRel);
-		lock (firstLock)
+		ReaderWriterLockSlim firstLock = GetFileLock(oldFirst ? oldRel : newRel);
+		ReaderWriterLockSlim secondLock = GetFileLock(oldFirst ? newRel : oldRel);
+		firstLock.EnterWriteLock();
+		try
 		{
-			lock (secondLock)
+			secondLock.EnterWriteLock();
+			try
 			{
 				_ram.RenamePrefix(oldRel, newRel);
 				_ssd.RenamePrefix(oldRel, newRel);
 				_scorer.RenamePrefix(oldRel, newRel);
+				_statCache.TryRemove(oldRel, out _);
+				_statCache.TryRemove(newRel, out _);
 			}
+			finally
+			{
+				secondLock.ExitWriteLock();
+			}
+		}
+		finally
+		{
+			firstLock.ExitWriteLock();
 		}
 	}
 
@@ -460,9 +549,15 @@ public sealed class HybridCacheEngine : IDisposable
 		foreach (string rel in dirtyFiles)
 		{
 			string fullPath = ResolveBackingPath(rel);
-			lock (GetFileLock(rel))
+			ReaderWriterLockSlim fileLock = GetFileLock(rel);
+			fileLock.EnterWriteLock();
+			try
 			{
 				totalFlushed += FlushFileLocked(rel, fullPath, null);
+			}
+			finally
+			{
+				fileLock.ExitWriteLock();
 			}
 		}
 
@@ -587,6 +682,11 @@ public sealed class HybridCacheEngine : IDisposable
 		Stop();
 		_ram.Dispose();
 		_ssd.Dispose();
+		foreach (ReaderWriterLockSlim rw in _fileLocks.Values)
+		{
+			rw.Dispose();
+		}
+		_fileLocks.Clear();
 	}
 
 	private int DemoteL1ToL2BeforeShutdown()
@@ -604,7 +704,9 @@ public sealed class HybridCacheEngine : IDisposable
 				continue;
 			}
 			string fullPath = ResolveBackingPath(entry.Key.RelativePath);
-			lock (GetFileLock(entry.Key.RelativePath))
+			ReaderWriterLockSlim fileLock = GetFileLock(entry.Key.RelativePath);
+			fileLock.EnterWriteLock();
+			try
 			{
 				if (PutInSsdWithEvictionFlushLocked(
 					entry.Key,
@@ -619,6 +721,10 @@ public sealed class HybridCacheEngine : IDisposable
 				{
 					count++;
 				}
+			}
+			finally
+			{
+				fileLock.ExitWriteLock();
 			}
 		}
 		return count;
@@ -681,15 +787,22 @@ public sealed class HybridCacheEngine : IDisposable
 		}
 
 		Dictionary<long, (byte[] Data, int ValidLength, bool FromRam)> pending = new Dictionary<long, (byte[], int, bool)>();
-		byte[] ssdReadBuf = new byte[_blockSize];
-		foreach (SsdBlockMeta sm in ssdDirty)
+		byte[] ssdReadBuf = ArrayPool<byte>.Shared.Rent(_blockSize);
+		try
 		{
-			if (_ssd.TryReadBlockForFlush(sm.Key, ssdReadBuf, out int vlen))
+			foreach (SsdBlockMeta sm in ssdDirty)
 			{
-				byte[] copy = new byte[_blockSize];
-				Buffer.BlockCopy(ssdReadBuf, 0, copy, 0, _blockSize);
-				pending[sm.Key.BlockIndex] = (copy, vlen, false);
+				if (_ssd.TryReadBlockForFlush(sm.Key, ssdReadBuf, out int vlen))
+				{
+					byte[] copy = new byte[_blockSize];
+					Buffer.BlockCopy(ssdReadBuf, 0, copy, 0, _blockSize);
+					pending[sm.Key.BlockIndex] = (copy, vlen, false);
+				}
 			}
+		}
+		finally
+		{
+			ArrayPool<byte>.Shared.Return(ssdReadBuf);
 		}
 		foreach (RamBlockCopy rm in ramDirty)
 		{
@@ -707,27 +820,58 @@ public sealed class HybridCacheEngine : IDisposable
 			Directory.CreateDirectory(dir);
 		}
 
+		KeyValuePair<long, (byte[] Data, int ValidLength, bool FromRam)>[] sorted = pending.OrderBy(p => p.Key).ToArray();
+		SafeFileHandle? ownedHandle = null;
+		SafeFileHandle targetHandle;
 		if (openBackingStream != null && openBackingStream.CanWrite)
 		{
-			foreach (KeyValuePair<long, (byte[] Data, int ValidLength, bool FromRam)> kv in pending.OrderBy(p => p.Key))
-			{
-				openBackingStream.Seek(kv.Key * _blockSize, SeekOrigin.Begin);
-				openBackingStream.Write(kv.Value.Data, 0, kv.Value.ValidLength);
-			}
-			openBackingStream.Flush(flushToDisk: true);
+			targetHandle = openBackingStream.SafeFileHandle;
 		}
 		else
 		{
-			using SafeFileHandle handle = File.OpenHandle(fullPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
-			foreach (KeyValuePair<long, (byte[] Data, int ValidLength, bool FromRam)> kv in pending.OrderBy(p => p.Key))
-			{
-				RandomAccess.Write(handle, kv.Value.Data.AsSpan(0, kv.Value.ValidLength), kv.Key * _blockSize);
-			}
-			RandomAccess.FlushToDisk(handle);
+			ownedHandle = File.OpenHandle(fullPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+			targetHandle = ownedHandle;
 		}
 
-		(_, long newSize, long newTicks) = GetBackingInfoLocked(fullPath, openBackingStream);
-		foreach (KeyValuePair<long, (byte[] Data, int ValidLength, bool FromRam)> kv in pending)
+		byte[] coalesceBuf = ArrayPool<byte>.Shared.Rent(MaxCoalescedFlushBlocks * _blockSize);
+		try
+		{
+			int idx = 0;
+			while (idx < sorted.Length)
+			{
+				long runStartBlock = sorted[idx].Key;
+				int runOffset = 0;
+				int runBlocks = 0;
+				long expectedNextBlock = runStartBlock;
+
+				while (idx < sorted.Length && runBlocks < MaxCoalescedFlushBlocks && sorted[idx].Key == expectedNextBlock)
+				{
+					int vlen = sorted[idx].Value.ValidLength;
+					Buffer.BlockCopy(sorted[idx].Value.Data, 0, coalesceBuf, runOffset, vlen);
+					runOffset += vlen;
+					runBlocks++;
+					idx++;
+					expectedNextBlock++;
+
+					// Only keep coalescing if the current block filled a complete _blockSize slot.
+					if (vlen < _blockSize)
+					{
+						break;
+					}
+				}
+
+				RandomAccess.Write(targetHandle, coalesceBuf.AsSpan(0, runOffset), runStartBlock * _blockSize);
+			}
+			RandomAccess.FlushToDisk(targetHandle);
+		}
+		finally
+		{
+			ArrayPool<byte>.Shared.Return(coalesceBuf);
+			ownedHandle?.Dispose();
+		}
+
+		(_, long newSize, long newTicks) = RefreshBackingInfoLocked(rel, fullPath, openBackingStream);
+		foreach (KeyValuePair<long, (byte[] Data, int ValidLength, bool FromRam)> kv in sorted)
 		{
 			BlockKey k = new BlockKey(rel, kv.Key);
 			_ram.MarkClean(k, newSize, newTicks);
@@ -738,7 +882,7 @@ public sealed class HybridCacheEngine : IDisposable
 		_ram.UpdateBackingMetadataForFile(rel, newSize, newTicks);
 		_ssd.UpdateBackingMetadataForFile(rel, newSize, newTicks);
 
-		return pending.Count;
+		return sorted.Length;
 	}
 
 	private void PutInRamWithDemotionLocked(
@@ -771,6 +915,9 @@ public sealed class HybridCacheEngine : IDisposable
 				if (!demoted && evicted.IsDirty)
 				{
 					WriteBackingRangeLocked(evictedPath, null, evicted.Key.BlockIndex * _blockSize, evicted.Data.AsSpan(0, evicted.ValidLength));
+					(_, long ns, long nt) = RefreshBackingInfoLocked(evicted.Key.RelativePath, evictedPath, null);
+					_ram.UpdateBackingMetadataForFile(evicted.Key.RelativePath, ns, nt);
+					_ssd.UpdateBackingMetadataForFile(evicted.Key.RelativePath, ns, nt);
 					_scorer.UpdateTierState(evicted.Key, CacheTier.None, false);
 				}
 			}
@@ -778,6 +925,9 @@ public sealed class HybridCacheEngine : IDisposable
 			{
 				string evictedPath = ResolveBackingPath(evicted.Key.RelativePath);
 				WriteBackingRangeLocked(evictedPath, null, evicted.Key.BlockIndex * _blockSize, evicted.Data.AsSpan(0, evicted.ValidLength));
+				(_, long ns, long nt) = RefreshBackingInfoLocked(evicted.Key.RelativePath, evictedPath, null);
+				_ram.UpdateBackingMetadataForFile(evicted.Key.RelativePath, ns, nt);
+				_ssd.UpdateBackingMetadataForFile(evicted.Key.RelativePath, ns, nt);
 				_scorer.UpdateTierState(evicted.Key, CacheTier.None, false);
 			}
 			else
@@ -812,6 +962,9 @@ public sealed class HybridCacheEngine : IDisposable
 					? openBackingStream
 					: null;
 				WriteBackingRangeLocked(evFull, streamToUse, evictedDirty.Key.BlockIndex * _blockSize, evictedDirty.Data.AsSpan(0, evictedDirty.ValidLength));
+				(_, long ns, long nt) = RefreshBackingInfoLocked(evictedDirty.Key.RelativePath, evFull, streamToUse);
+				_ram.UpdateBackingMetadataForFile(evictedDirty.Key.RelativePath, ns, nt);
+				_ssd.UpdateBackingMetadataForFile(evictedDirty.Key.RelativePath, ns, nt);
 				_scorer.UpdateTierState(evictedDirty.Key, CacheTier.None, false);
 			}
 			if (ok)
@@ -827,41 +980,63 @@ public sealed class HybridCacheEngine : IDisposable
 		}
 	}
 
-	private (bool Exists, long Size, long LastWriteUtcTicks) GetBackingInfoLocked(string fullPath, FileStream? openBackingStream)
+	private (bool Exists, long Size, long LastWriteUtcTicks) GetBackingInfoFast(string rel, string fullPath, FileStream? openBackingStream)
 	{
+		if (_statTtlStopwatchTicks > 0 && openBackingStream == null && _statCache.TryGetValue(rel, out CachedBackingStat cached))
+		{
+			if (Stopwatch.GetTimestamp() - cached.CachedAtTimestamp <= _statTtlStopwatchTicks)
+			{
+				return (cached.Exists, cached.Size, cached.LastWriteUtcTicks);
+			}
+		}
+		return RefreshBackingInfoLocked(rel, fullPath, openBackingStream);
+	}
+
+	private (bool Exists, long Size, long LastWriteUtcTicks) RefreshBackingInfoLocked(string rel, string fullPath, FileStream? openBackingStream)
+	{
+		(bool Exists, long Size, long LastWriteUtcTicks) result;
 		if (!File.Exists(fullPath))
 		{
 			if (openBackingStream != null)
 			{
-				return (true, openBackingStream.Length, File.GetLastWriteTimeUtc(fullPath).Ticks);
+				result = (true, openBackingStream.Length, File.GetLastWriteTimeUtc(fullPath).Ticks);
 			}
-			return (false, 0, 0);
+			else
+			{
+				result = (false, 0, 0);
+			}
 		}
-		FileInfo fi = new FileInfo(fullPath);
-		long size = openBackingStream != null ? Math.Max(fi.Length, openBackingStream.Length) : fi.Length;
-		return (true, size, fi.LastWriteTimeUtc.Ticks);
+		else
+		{
+			FileInfo fi = new FileInfo(fullPath);
+			long size = openBackingStream != null ? Math.Max(fi.Length, openBackingStream.Length) : fi.Length;
+			result = (true, size, fi.LastWriteTimeUtc.Ticks);
+		}
+
+		if (_statTtlStopwatchTicks > 0 && openBackingStream == null)
+		{
+			_statCache[rel] = new CachedBackingStat
+			{
+				Exists = result.Exists,
+				Size = result.Size,
+				LastWriteUtcTicks = result.LastWriteUtcTicks,
+				CachedAtTimestamp = Stopwatch.GetTimestamp()
+			};
+		}
+		return result;
 	}
 
-	private int ReadBackingBlockLocked(string fullPath, FileStream? openBackingStream, long offset, byte[] buffer)
+	private static int ReadBackingBlockLocked(string fullPath, FileStream? openBackingStream, long offset, Span<byte> buffer)
 	{
 		if (openBackingStream != null && openBackingStream.CanRead)
 		{
-			if (offset >= openBackingStream.Length)
+			SafeFileHandle handle = openBackingStream.SafeFileHandle;
+			long streamLen = RandomAccess.GetLength(handle);
+			if (offset >= streamLen)
 			{
 				return 0;
 			}
-			openBackingStream.Seek(offset, SeekOrigin.Begin);
-			int total = 0;
-			while (total < buffer.Length)
-			{
-				int n = openBackingStream.Read(buffer, total, buffer.Length - total);
-				if (n <= 0)
-				{
-					break;
-				}
-				total += n;
-			}
-			return total;
+			return ReadExactHandle(handle, offset, buffer);
 		}
 
 		if (!File.Exists(fullPath))
@@ -869,16 +1044,21 @@ public sealed class HybridCacheEngine : IDisposable
 			return 0;
 		}
 
-		using SafeFileHandle handle = File.OpenHandle(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-		long len = RandomAccess.GetLength(handle);
+		using SafeFileHandle owned = File.OpenHandle(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+		long len = RandomAccess.GetLength(owned);
 		if (offset >= len)
 		{
 			return 0;
 		}
+		return ReadExactHandle(owned, offset, buffer);
+	}
+
+	private static int ReadExactHandle(SafeFileHandle handle, long offset, Span<byte> buffer)
+	{
 		int readTotal = 0;
 		while (readTotal < buffer.Length)
 		{
-			int n = RandomAccess.Read(handle, buffer.AsSpan(readTotal), offset + readTotal);
+			int n = RandomAccess.Read(handle, buffer.Slice(readTotal), offset + readTotal);
 			if (n <= 0)
 			{
 				break;
@@ -897,9 +1077,8 @@ public sealed class HybridCacheEngine : IDisposable
 		}
 		if (openBackingStream != null && openBackingStream.CanWrite)
 		{
-			openBackingStream.Seek(offset, SeekOrigin.Begin);
-			openBackingStream.Write(data);
-			openBackingStream.Flush(flushToDisk: true);
+			RandomAccess.Write(openBackingStream.SafeFileHandle, data, offset);
+			RandomAccess.FlushToDisk(openBackingStream.SafeFileHandle);
 			return;
 		}
 		using SafeFileHandle handle = File.OpenHandle(fullPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
@@ -919,9 +1098,9 @@ public sealed class HybridCacheEngine : IDisposable
 		return combined;
 	}
 
-	private object GetFileLock(string normalizedRelPath)
+	private ReaderWriterLockSlim GetFileLock(string normalizedRelPath)
 	{
-		return _fileLocks.GetOrAdd(normalizedRelPath, _ => new object());
+		return _fileLocks.GetOrAdd(normalizedRelPath, _ => new ReaderWriterLockSlim(LockRecursionPolicy.NoRecursion));
 	}
 
 	private async Task FlushLoopAsync(CancellationToken token)

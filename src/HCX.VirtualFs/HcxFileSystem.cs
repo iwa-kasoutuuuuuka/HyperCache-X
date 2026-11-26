@@ -80,14 +80,14 @@ public sealed class HcxFileSystem : FileSystemBase
 		host.SectorSize = AllocationUnit;
 		host.SectorsPerAllocationUnit = 1;
 		host.MaxComponentLength = 255;
-		host.FileInfoTimeout = 500;
+		host.FileInfoTimeout = 1000;
 		host.CaseSensitiveSearch = false;
 		host.CasePreservedNames = true;
 		host.UnicodeOnDisk = true;
 		host.PersistentAcls = true;
 		host.PostCleanupWhenModifiedOnly = true;
 		host.PassQueryDirectoryPattern = true;
-		host.FlushAndPurgeOnCleanup = true;
+		host.FlushAndPurgeOnCleanup = false;
 		host.VolumeCreationTime = (ulong)Directory.GetCreationTimeUtc(_rootPath).ToFileTimeUtc();
 		host.VolumeSerialNumber = (uint)_engine.InstanceId.GetHashCode();
 		host.FileSystemName = "HCX-NTFS";
@@ -217,6 +217,7 @@ public sealed class HcxFileSystem : FileSystemBase
 		{
 			string rel = ToRelativePath(fileName);
 			string fullPath = ToFullPath(fileName);
+			_engine.InvalidateBackingStatCache(rel);
 
 			if (!Directory.Exists(fullPath))
 			{
@@ -321,22 +322,23 @@ public sealed class HcxFileSystem : FileSystemBase
 		}
 
 		int readLen = (int)Math.Min((ulong)int.MaxValue, Math.Min((ulong)length, (ulong)effectiveSize - offset));
-		byte[] rented = ArrayPool<byte>.Shared.Rent(readLen);
-		try
+		if (readLen == 0)
 		{
-			int actual = _engine.ReadBlockRange(desc.RelativePath, (long)offset, rented.AsSpan(0, readLen), desc.Stream);
+			bytesTransferred = 0;
+			return STATUS_SUCCESS;
+		}
+
+		unsafe
+		{
+			Span<byte> destSpan = new Span<byte>(buffer.ToPointer(), readLen);
+			int actual = _engine.ReadBlockRange(desc.RelativePath, (long)offset, destSpan, desc.Stream);
 			if (actual <= 0)
 			{
 				bytesTransferred = 0;
 				return STATUS_END_OF_FILE;
 			}
-			Marshal.Copy(rented, 0, buffer, actual);
 			bytesTransferred = (uint)actual;
 			return STATUS_SUCCESS;
-		}
-		finally
-		{
-			ArrayPool<byte>.Shared.Return(rented);
 		}
 	}
 
@@ -378,17 +380,12 @@ public sealed class HcxFileSystem : FileSystemBase
 			return GetFileInfoInternal(desc, out fileInfo);
 		}
 
-		byte[] rented = ArrayPool<byte>.Shared.Rent((int)length);
-		try
+		unsafe
 		{
-			Marshal.Copy(buffer, rented, 0, (int)length);
-			int written = _engine.WriteBlockRange(desc.RelativePath, (long)writeOffset, rented.AsSpan(0, (int)length), desc.Stream);
+			ReadOnlySpan<byte> srcSpan = new ReadOnlySpan<byte>(buffer.ToPointer(), (int)length);
+			int written = _engine.WriteBlockRange(desc.RelativePath, (long)writeOffset, srcSpan, desc.Stream);
 			bytesTransferred = (uint)written;
 			return GetFileInfoInternal(desc, out fileInfo);
-		}
-		finally
-		{
-			ArrayPool<byte>.Shared.Return(rented);
 		}
 	}
 

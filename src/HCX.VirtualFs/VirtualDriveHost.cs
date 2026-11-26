@@ -40,7 +40,7 @@ public sealed class VirtualDriveHost : IDisposable
 
 		string normalizedMount = mountPoint.Trim().TrimEnd('\\');
 		FileSystemHost host = new FileSystemHost(_fs);
-		int result = host.Mount(normalizedMount, null, true, 0);
+		int result = host.MountEx(normalizedMount, 0, null, false, 0);
 		if (result < 0)
 		{
 			host.Dispose();

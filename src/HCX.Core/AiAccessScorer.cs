@@ -51,7 +51,12 @@ public sealed class AiAccessScorer
 		_maxTrackedBlocks = Math.Max(1024, maxTrackedBlocks);
 	}
 
-	public ScoreDecision RecordAccess(BlockKey key, bool isWrite, DateTime utcNow)
+	public ScoreDecision RecordAccess(
+		BlockKey key,
+		bool isWrite,
+		DateTime utcNow,
+		CacheTier? updateTier = null,
+		bool? updateDirty = null)
 	{
 		lock (_sync)
 		{
@@ -87,8 +92,10 @@ public sealed class AiAccessScorer
 				_blocks[key] = state;
 			}
 
-			double elapsedSeconds = Math.Max(0.0, (utcNow - state.LastAccessUtc).TotalSeconds);
-			double decayed = state.Score * Math.Exp(-elapsedSeconds / 300.0);
+			double elapsedSeconds = (utcNow - state.LastAccessUtc).TotalSeconds;
+			double decayed = elapsedSeconds >= 1.0
+				? state.Score * Math.Exp(-elapsedSeconds / 300.0)
+				: state.Score;
 			double increment = isSequentialBypass
 				? 0.05
 				: (isWrite ? 1.8 : (seq.SequentialStreak == 0 ? 1.5 : 1.0));
@@ -96,6 +103,14 @@ public sealed class AiAccessScorer
 			state.Score = Math.Min(100.0, decayed + increment);
 			state.LastAccessUtc = utcNow;
 			state.HitCount++;
+			if (updateTier.HasValue)
+			{
+				state.Tier = updateTier.Value;
+			}
+			if (updateDirty.HasValue)
+			{
+				state.IsDirty = updateDirty.Value;
+			}
 
 			return new ScoreDecision
 			{

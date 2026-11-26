@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace HCX.Core;
 
@@ -16,7 +17,8 @@ public sealed class RamBlockCopy
 }
 
 /// <summary>
-/// Thread-safe Tier-1 in-memory 64 KB block cache with strict capacity and LRU eviction.
+/// Thread-safe Tier-1 in-memory 64 KB block cache with ReaderWriterLockSlim parallel reads,
+/// O(1) per-file dirty tracking, and sampled LRU eviction.
 /// </summary>
 public sealed class RamCacheTier : IL1CacheTier
 {
@@ -24,24 +26,33 @@ public sealed class RamCacheTier : IL1CacheTier
 	{
 		public required BlockKey Key;
 		public required byte[] Data;
+		public int KeyIndex;
 		public int ValidLength;
 		public bool IsDirty;
 		public long BackingFileSize;
 		public long BackingLastWriteUtcTicks;
-		public DateTime LastAccessUtc;
+		public long LastAccessStamp;
+		public long LastAccessUtcTicks;
 		public double AiScore;
 	}
 
-	private readonly object _sync = new object();
-	private readonly Dictionary<BlockKey, LinkedListNode<Entry>> _map = new Dictionary<BlockKey, LinkedListNode<Entry>>();
-	private readonly LinkedList<Entry> _lru = new LinkedList<Entry>();
+	private readonly ReaderWriterLockSlim _rwLock = new ReaderWriterLockSlim(LockRecursionPolicy.NoRecursion);
+	private readonly Dictionary<BlockKey, Entry> _map = new Dictionary<BlockKey, Entry>();
+	private readonly List<BlockKey> _keys = new List<BlockKey>();
+	private readonly Dictionary<string, HashSet<BlockKey>> _keysByFile = new Dictionary<string, HashSet<BlockKey>>(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, Dictionary<long, int>> _dirtyBlocksByFile = new Dictionary<string, Dictionary<long, int>>(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, long> _dirtyMaxEndByFile = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
 	private readonly int _blockSize;
 	private readonly int _maxBlocks;
+	private long _accessClock;
+	private int _evictCursor;
 	private int _dirtyCount;
+	private bool _disposed;
 
 	public int BlockSize => _blockSize;
 	public int MaxBlocks => _maxBlocks;
-	public bool IsEnabled => _maxBlocks > 0;
+	public bool IsEnabled => _maxBlocks > 0 && !_disposed;
 	public string BackendDescription => IsEnabled ? "In-Process RAM" : "OFF";
 
 	public RamCacheTier(long capacityBytes, int blockSizeBytes)
@@ -68,39 +79,61 @@ public sealed class RamCacheTier : IL1CacheTier
 			return false;
 		}
 
-		lock (_sync)
+		bool needsEvictStale = false;
+		_rwLock.EnterReadLock();
+		try
 		{
-			if (!_map.TryGetValue(key, out LinkedListNode<Entry>? node))
+			if (!_map.TryGetValue(key, out Entry? e))
 			{
 				return false;
 			}
 
-			Entry e = node.Value;
 			if (!e.IsDirty && (e.BackingFileSize != currentBackingSize || e.BackingLastWriteUtcTicks != currentBackingTicks))
 			{
-				RemoveNodeLocked(node);
-				invalidatedStale = true;
-				return false;
+				needsEvictStale = true;
 			}
-
-			_lru.Remove(node);
-			_lru.AddFirst(node);
-			e.LastAccessUtc = DateTime.UtcNow;
-			isDirty = e.IsDirty;
-
-			int available = Math.Max(0, e.ValidLength - blockOffset);
-			bytesCopied = Math.Min(destination.Length, available);
-			if (bytesCopied > 0)
+			else
 			{
-				e.Data.AsSpan(blockOffset, bytesCopied).CopyTo(destination);
+				long stamp = Interlocked.Increment(ref _accessClock);
+				Volatile.Write(ref e.LastAccessStamp, stamp);
+				Volatile.Write(ref e.LastAccessUtcTicks, DateTime.UtcNow.Ticks);
+				isDirty = e.IsDirty;
+
+				int available = Math.Max(0, e.ValidLength - blockOffset);
+				bytesCopied = Math.Min(destination.Length, available);
+				if (bytesCopied > 0)
+				{
+					e.Data.AsSpan(blockOffset, bytesCopied).CopyTo(destination);
+				}
+				return true;
 			}
-			return true;
 		}
+		finally
+		{
+			_rwLock.ExitReadLock();
+		}
+
+		if (needsEvictStale)
+		{
+			_rwLock.EnterWriteLock();
+			try
+			{
+				if (_map.TryGetValue(key, out Entry? stale) &&
+				    !stale.IsDirty &&
+				    (stale.BackingFileSize != currentBackingSize || stale.BackingLastWriteUtcTicks != currentBackingTicks))
+				{
+					RemoveEntryLocked(stale);
+					invalidatedStale = true;
+				}
+			}
+			finally
+			{
+				_rwLock.ExitWriteLock();
+			}
+		}
+		return false;
 	}
 
-	/// <summary>
-	/// Inserts or updates a block in L1 RAM. Returns an evicted entry if capacity was exceeded.
-	/// </summary>
 	public RamBlockCopy? Put(
 		BlockKey key,
 		ReadOnlySpan<byte> blockData,
@@ -115,54 +148,51 @@ public sealed class RamCacheTier : IL1CacheTier
 			return null;
 		}
 
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			if (_map.TryGetValue(key, out LinkedListNode<Entry>? existing))
+			long stamp = Interlocked.Increment(ref _accessClock);
+			long utcTicks = DateTime.UtcNow.Ticks;
+
+			if (_map.TryGetValue(key, out Entry? existing))
 			{
-				Entry e = existing.Value;
-				blockData.Slice(0, Math.Min(blockData.Length, _blockSize)).CopyTo(e.Data);
+				int copyLen = Math.Min(blockData.Length, _blockSize);
+				blockData.Slice(0, copyLen).CopyTo(existing.Data);
 				if (validLength < _blockSize)
 				{
-					Array.Clear(e.Data, validLength, _blockSize - validLength);
+					Array.Clear(existing.Data, validLength, _blockSize - validLength);
 				}
-				e.ValidLength = validLength;
-				if (!e.IsDirty && isDirty)
-				{
-					_dirtyCount++;
-				}
-				else if (e.IsDirty && !isDirty)
-				{
-					_dirtyCount = Math.Max(0, _dirtyCount - 1);
-				}
-				e.IsDirty = isDirty;
-				e.BackingFileSize = backingSize;
-				e.BackingLastWriteUtcTicks = backingTicks;
-				e.LastAccessUtc = DateTime.UtcNow;
-				e.AiScore = aiScore;
-				_lru.Remove(existing);
-				_lru.AddFirst(existing);
+				bool wasDirty = existing.IsDirty;
+				existing.ValidLength = validLength;
+				existing.IsDirty = isDirty;
+				existing.BackingFileSize = backingSize;
+				existing.BackingLastWriteUtcTicks = backingTicks;
+				existing.LastAccessStamp = stamp;
+				existing.LastAccessUtcTicks = utcTicks;
+				existing.AiScore = aiScore;
+				UpdateDirtyIndexOnStateChangeLocked(key, wasDirty, isDirty, validLength);
 				return null;
 			}
 
 			RamBlockCopy? evicted = null;
-			if (_map.Count >= _maxBlocks && _lru.Last != null)
+			if (_map.Count >= _maxBlocks)
 			{
-				LinkedListNode<Entry> tail = _lru.Last;
-				Entry tailEntry = tail.Value;
-				byte[] copy = new byte[_blockSize];
-				Buffer.BlockCopy(tailEntry.Data, 0, copy, 0, _blockSize);
-				evicted = new RamBlockCopy
+				Entry? victim = SelectVictimLocked();
+				if (victim != null)
 				{
-					Key = tailEntry.Key,
-					Data = copy,
-					ValidLength = tailEntry.ValidLength,
-					IsDirty = tailEntry.IsDirty,
-					BackingFileSize = tailEntry.BackingFileSize,
-					BackingLastWriteUtcTicks = tailEntry.BackingLastWriteUtcTicks,
-					LastAccessUtc = tailEntry.LastAccessUtc,
-					AiScore = tailEntry.AiScore
-				};
-				RemoveNodeLocked(tail);
+					evicted = new RamBlockCopy
+					{
+						Key = victim.Key,
+						Data = victim.Data,
+						ValidLength = victim.ValidLength,
+						IsDirty = victim.IsDirty,
+						BackingFileSize = victim.BackingFileSize,
+						BackingLastWriteUtcTicks = victim.BackingLastWriteUtcTicks,
+						LastAccessUtc = new DateTime(Volatile.Read(ref victim.LastAccessUtcTicks), DateTimeKind.Utc),
+						AiScore = victim.AiScore
+					};
+					RemoveEntryLocked(victim);
+				}
 			}
 
 			byte[] buffer = new byte[_blockSize];
@@ -171,20 +201,28 @@ public sealed class RamCacheTier : IL1CacheTier
 			{
 				Key = key,
 				Data = buffer,
+				KeyIndex = _keys.Count,
 				ValidLength = validLength,
 				IsDirty = isDirty,
 				BackingFileSize = backingSize,
 				BackingLastWriteUtcTicks = backingTicks,
-				LastAccessUtc = DateTime.UtcNow,
+				LastAccessStamp = stamp,
+				LastAccessUtcTicks = utcTicks,
 				AiScore = aiScore
 			};
-			LinkedListNode<Entry> newNode = _lru.AddFirst(created);
-			_map[key] = newNode;
+			_keys.Add(key);
+			_map[key] = created;
+			AddFileKeyIndexLocked(key);
 			if (isDirty)
 			{
 				_dirtyCount++;
+				SetDirtyIndexLocked(key, validLength);
 			}
 			return evicted;
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
@@ -201,250 +239,506 @@ public sealed class RamCacheTier : IL1CacheTier
 		{
 			return false;
 		}
-		lock (_sync)
+
+		_rwLock.EnterWriteLock();
+		try
 		{
-			if (!_map.TryGetValue(key, out LinkedListNode<Entry>? node))
+			if (!_map.TryGetValue(key, out Entry? e))
 			{
 				return false;
 			}
-			Entry e = node.Value;
 			if (!e.IsDirty && (e.BackingFileSize != backingSize || e.BackingLastWriteUtcTicks != backingTicks))
 			{
-				RemoveNodeLocked(node);
+				RemoveEntryLocked(e);
 				return false;
 			}
+
 			patchData.CopyTo(e.Data.AsSpan(blockOffset));
 			int end = blockOffset + patchData.Length;
 			if (end > e.ValidLength)
 			{
 				e.ValidLength = end;
 			}
-			if (markDirty && !e.IsDirty)
+			bool wasDirty = e.IsDirty;
+			if (markDirty)
 			{
 				e.IsDirty = true;
-				_dirtyCount++;
 			}
-			if (!markDirty)
+			else
 			{
 				e.BackingFileSize = backingSize;
 				e.BackingLastWriteUtcTicks = backingTicks;
 			}
-			e.LastAccessUtc = DateTime.UtcNow;
+			UpdateDirtyIndexOnStateChangeLocked(key, wasDirty, e.IsDirty, e.ValidLength);
+
+			e.LastAccessStamp = Interlocked.Increment(ref _accessClock);
+			e.LastAccessUtcTicks = DateTime.UtcNow.Ticks;
 			e.AiScore = aiScore;
-			_lru.Remove(node);
-			_lru.AddFirst(node);
 			return true;
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public List<RamBlockCopy> SnapshotEntries(string? filterRelativePath = null, bool dirtyOnly = false)
 	{
-		lock (_sync)
+		_rwLock.EnterReadLock();
+		try
 		{
 			List<RamBlockCopy> result = new List<RamBlockCopy>();
-			foreach (Entry e in _lru)
+			if (filterRelativePath != null)
 			{
-				if (dirtyOnly && !e.IsDirty)
+				if (dirtyOnly)
 				{
-					continue;
+					if (_dirtyBlocksByFile.TryGetValue(filterRelativePath, out Dictionary<long, int>? dirtyBlocks))
+					{
+						foreach (long blockIdx in dirtyBlocks.Keys)
+						{
+							if (_map.TryGetValue(new BlockKey(filterRelativePath, blockIdx), out Entry? e) && e.IsDirty)
+							{
+								result.Add(CloneEntry(e));
+							}
+						}
+					}
+					return result;
 				}
-				if (filterRelativePath != null &&
-				    !string.Equals(e.Key.RelativePath, filterRelativePath, StringComparison.OrdinalIgnoreCase))
+
+				if (_keysByFile.TryGetValue(filterRelativePath, out HashSet<BlockKey>? keys))
 				{
-					continue;
+					foreach (BlockKey k in keys)
+					{
+						if (_map.TryGetValue(k, out Entry? e))
+						{
+							result.Add(CloneEntry(e));
+						}
+					}
 				}
-				byte[] dataCopy = new byte[_blockSize];
-				Buffer.BlockCopy(e.Data, 0, dataCopy, 0, _blockSize);
-				result.Add(new RamBlockCopy
+				return result;
+			}
+
+			if (dirtyOnly)
+			{
+				foreach (KeyValuePair<string, Dictionary<long, int>> fileKv in _dirtyBlocksByFile)
 				{
-					Key = e.Key,
-					Data = dataCopy,
-					ValidLength = e.ValidLength,
-					IsDirty = e.IsDirty,
-					BackingFileSize = e.BackingFileSize,
-					BackingLastWriteUtcTicks = e.BackingLastWriteUtcTicks,
-					LastAccessUtc = e.LastAccessUtc,
-					AiScore = e.AiScore
-				});
+					foreach (long blockIdx in fileKv.Value.Keys)
+					{
+						if (_map.TryGetValue(new BlockKey(fileKv.Key, blockIdx), out Entry? e) && e.IsDirty)
+						{
+							result.Add(CloneEntry(e));
+						}
+					}
+				}
+				return result;
+			}
+
+			foreach (Entry e in _map.Values)
+			{
+				result.Add(CloneEntry(e));
 			}
 			return result;
+		}
+		finally
+		{
+			_rwLock.ExitReadLock();
 		}
 	}
 
 	public void MarkClean(BlockKey key, long newBackingSize, long newBackingTicks)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			if (_map.TryGetValue(key, out LinkedListNode<Entry>? node))
+			if (_map.TryGetValue(key, out Entry? e))
 			{
-				if (node.Value.IsDirty)
+				if (e.IsDirty)
 				{
-					node.Value.IsDirty = false;
+					e.IsDirty = false;
 					_dirtyCount = Math.Max(0, _dirtyCount - 1);
+					RemoveDirtyIndexLocked(key);
 				}
-				node.Value.BackingFileSize = newBackingSize;
-				node.Value.BackingLastWriteUtcTicks = newBackingTicks;
+				e.BackingFileSize = newBackingSize;
+				e.BackingLastWriteUtcTicks = newBackingTicks;
 			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void UpdateBackingMetadataForFile(string normalizedRelPath, long newBackingSize, long newBackingTicks)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			foreach (Entry e in _lru)
+			if (_keysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
 			{
-				if (!e.IsDirty && string.Equals(e.Key.RelativePath, normalizedRelPath, StringComparison.OrdinalIgnoreCase))
+				foreach (BlockKey k in keys)
 				{
-					e.BackingFileSize = newBackingSize;
-					e.BackingLastWriteUtcTicks = newBackingTicks;
+					if (_map.TryGetValue(k, out Entry? e) && !e.IsDirty)
+					{
+						e.BackingFileSize = newBackingSize;
+						e.BackingLastWriteUtcTicks = newBackingTicks;
+					}
 				}
 			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void Remove(BlockKey key)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			if (_map.TryGetValue(key, out LinkedListNode<Entry>? node))
+			if (_map.TryGetValue(key, out Entry? e))
 			{
-				RemoveNodeLocked(node);
+				RemoveEntryLocked(e);
 			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void RemoveByFile(string normalizedRelPath)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			List<LinkedListNode<Entry>> toRemove = new List<LinkedListNode<Entry>>();
-			for (LinkedListNode<Entry>? n = _lru.First; n != null; n = n.Next)
+			if (!_keysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
 			{
-				if (string.Equals(n.Value.Key.RelativePath, normalizedRelPath, StringComparison.OrdinalIgnoreCase))
+				return;
+			}
+			List<BlockKey> toRemove = new List<BlockKey>(keys);
+			foreach (BlockKey k in toRemove)
+			{
+				if (_map.TryGetValue(k, out Entry? e))
 				{
-					toRemove.Add(n);
+					RemoveEntryLocked(e);
 				}
 			}
-			foreach (LinkedListNode<Entry> n in toRemove)
-			{
-				RemoveNodeLocked(n);
-			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void TruncateFile(string normalizedRelPath, long newSize)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
-			long lastValidBlock = newSize <= 0 ? -1 : (newSize - 1) / _blockSize;
-			List<LinkedListNode<Entry>> toRemove = new List<LinkedListNode<Entry>>();
-			for (LinkedListNode<Entry>? n = _lru.First; n != null; n = n.Next)
+			if (!_keysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
 			{
-				Entry e = n.Value;
-				if (!string.Equals(e.Key.RelativePath, normalizedRelPath, StringComparison.OrdinalIgnoreCase))
+				return;
+			}
+			long lastValidBlock = newSize <= 0 ? -1 : (newSize - 1) / _blockSize;
+			List<BlockKey> snapshot = new List<BlockKey>(keys);
+			foreach (BlockKey k in snapshot)
+			{
+				if (!_map.TryGetValue(k, out Entry? e))
 				{
 					continue;
 				}
-				if (e.Key.BlockIndex > lastValidBlock)
+				if (k.BlockIndex > lastValidBlock)
 				{
-					toRemove.Add(n);
+					RemoveEntryLocked(e);
 				}
-				else if (e.Key.BlockIndex == lastValidBlock)
+				else if (k.BlockIndex == lastValidBlock)
 				{
 					int newValidLen = (int)(newSize - lastValidBlock * _blockSize);
 					if (newValidLen < e.ValidLength)
 					{
 						Array.Clear(e.Data, newValidLen, e.ValidLength - newValidLen);
 						e.ValidLength = newValidLen;
+						if (e.IsDirty)
+						{
+							SetDirtyIndexLocked(k, newValidLen);
+						}
 					}
 				}
 			}
-			foreach (LinkedListNode<Entry> n in toRemove)
-			{
-				RemoveNodeLocked(n);
-			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void RenamePrefix(string oldRelPath, string newRelPath)
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
 			string oldPrefix = oldRelPath.TrimEnd('\\') + "\\";
-			List<(LinkedListNode<Entry> Node, BlockKey NewKey)> renames = new List<(LinkedListNode<Entry>, BlockKey)>();
-			for (LinkedListNode<Entry>? n = _lru.First; n != null; n = n.Next)
+			List<(Entry Entry, BlockKey NewKey)> renames = new List<(Entry, BlockKey)>();
+			foreach (KeyValuePair<string, HashSet<BlockKey>> kv in _keysByFile)
 			{
-				BlockKey k = n.Value.Key;
-				if (string.Equals(k.RelativePath, oldRelPath, StringComparison.OrdinalIgnoreCase))
+				if (string.Equals(kv.Key, oldRelPath, StringComparison.OrdinalIgnoreCase) ||
+				    kv.Key.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
 				{
-					renames.Add((n, new BlockKey(newRelPath, k.BlockIndex)));
-				}
-				else if (k.RelativePath.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
-				{
-					string suffix = k.RelativePath.Substring(oldPrefix.Length);
-					renames.Add((n, new BlockKey(newRelPath.TrimEnd('\\') + "\\" + suffix, k.BlockIndex)));
+					foreach (BlockKey k in kv.Value)
+					{
+						if (!_map.TryGetValue(k, out Entry? e))
+						{
+							continue;
+						}
+						string nextPath = string.Equals(k.RelativePath, oldRelPath, StringComparison.OrdinalIgnoreCase)
+							? newRelPath
+							: newRelPath.TrimEnd('\\') + "\\" + k.RelativePath.Substring(oldPrefix.Length);
+						renames.Add((e, new BlockKey(nextPath, k.BlockIndex)));
+					}
 				}
 			}
-			foreach ((LinkedListNode<Entry> node, BlockKey newKey) in renames)
+
+			foreach ((Entry entry, BlockKey newKey) in renames)
 			{
-				_map.Remove(node.Value.Key);
-				node.Value.Key = newKey;
-				_map[newKey] = node;
+				BlockKey oldKey = entry.Key;
+				bool wasDirty = entry.IsDirty;
+				int validLen = entry.ValidLength;
+				int idx = entry.KeyIndex;
+
+				_map.Remove(oldKey);
+				RemoveFileKeyIndexLocked(oldKey);
+				if (wasDirty)
+				{
+					RemoveDirtyIndexLocked(oldKey);
+				}
+
+				entry.Key = newKey;
+				_keys[idx] = newKey;
+				_map[newKey] = entry;
+				AddFileKeyIndexLocked(newKey);
+				if (wasDirty)
+				{
+					SetDirtyIndexLocked(newKey, validLen);
+				}
 			}
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public long GetTrackedMaxFileSize(string normalizedRelPath)
 	{
-		lock (_sync)
+		_rwLock.EnterReadLock();
+		try
 		{
-			long maxEnd = 0;
-			foreach (Entry e in _lru)
-			{
-				if (e.IsDirty && string.Equals(e.Key.RelativePath, normalizedRelPath, StringComparison.OrdinalIgnoreCase))
-				{
-					long end = e.Key.BlockIndex * _blockSize + e.ValidLength;
-					if (end > maxEnd)
-					{
-						maxEnd = end;
-					}
-				}
-			}
-			return maxEnd;
+			return _dirtyMaxEndByFile.TryGetValue(normalizedRelPath, out long maxEnd) ? maxEnd : 0L;
+		}
+		finally
+		{
+			_rwLock.ExitReadLock();
 		}
 	}
 
 	public (int CachedBlocks, long UsedBytes, int DirtyBlocks) GetCounts()
 	{
-		lock (_sync)
+		_rwLock.EnterReadLock();
+		try
 		{
 			return (_map.Count, (long)_map.Count * _blockSize, _dirtyCount);
+		}
+		finally
+		{
+			_rwLock.ExitReadLock();
 		}
 	}
 
 	public void Clear()
 	{
-		lock (_sync)
+		_rwLock.EnterWriteLock();
+		try
 		{
 			_map.Clear();
-			_lru.Clear();
+			_keys.Clear();
+			_keysByFile.Clear();
+			_dirtyBlocksByFile.Clear();
+			_dirtyMaxEndByFile.Clear();
 			_dirtyCount = 0;
+		}
+		finally
+		{
+			_rwLock.ExitWriteLock();
 		}
 	}
 
 	public void Dispose()
 	{
+		if (_disposed)
+		{
+			return;
+		}
+		_disposed = true;
 		Clear();
+		_rwLock.Dispose();
 	}
 
-	private void RemoveNodeLocked(LinkedListNode<Entry> node)
+	private RamBlockCopy CloneEntry(Entry e)
 	{
-		if (node.Value.IsDirty)
+		byte[] copy = new byte[_blockSize];
+		Buffer.BlockCopy(e.Data, 0, copy, 0, _blockSize);
+		return new RamBlockCopy
+		{
+			Key = e.Key,
+			Data = copy,
+			ValidLength = e.ValidLength,
+			IsDirty = e.IsDirty,
+			BackingFileSize = e.BackingFileSize,
+			BackingLastWriteUtcTicks = e.BackingLastWriteUtcTicks,
+			LastAccessUtc = new DateTime(Volatile.Read(ref e.LastAccessUtcTicks), DateTimeKind.Utc),
+			AiScore = e.AiScore
+		};
+	}
+
+	private Entry? SelectVictimLocked()
+	{
+		int count = _keys.Count;
+		if (count == 0)
+		{
+			return null;
+		}
+
+		int samples = count <= 64 ? count : 32;
+		int stride = count <= 64 ? 1 : Math.Max(1, count / samples);
+		Entry? oldest = null;
+		long oldestStamp = long.MaxValue;
+
+		int start = count <= 64 ? 0 : (_evictCursor % count);
+		for (int i = 0; i < samples; i++)
+		{
+			int idx = (start + i * stride) % count;
+			Entry candidate = _map[_keys[idx]];
+			long stamp = Volatile.Read(ref candidate.LastAccessStamp);
+			if (stamp < oldestStamp)
+			{
+				oldestStamp = stamp;
+				oldest = candidate;
+			}
+		}
+		_evictCursor = (start + 1) % Math.Max(1, count);
+		return oldest;
+	}
+
+	private void RemoveEntryLocked(Entry e)
+	{
+		if (e.IsDirty)
 		{
 			_dirtyCount = Math.Max(0, _dirtyCount - 1);
+			RemoveDirtyIndexLocked(e.Key);
 		}
-		_map.Remove(node.Value.Key);
-		_lru.Remove(node);
+		_map.Remove(e.Key);
+		RemoveFileKeyIndexLocked(e.Key);
+
+		int idx = e.KeyIndex;
+		int last = _keys.Count - 1;
+		if (idx < last)
+		{
+			BlockKey movedKey = _keys[last];
+			_keys[idx] = movedKey;
+			_map[movedKey].KeyIndex = idx;
+		}
+		_keys.RemoveAt(last);
+	}
+
+	private void AddFileKeyIndexLocked(BlockKey key)
+	{
+		if (!_keysByFile.TryGetValue(key.RelativePath, out HashSet<BlockKey>? set))
+		{
+			set = new HashSet<BlockKey>();
+			_keysByFile[key.RelativePath] = set;
+		}
+		set.Add(key);
+	}
+
+	private void RemoveFileKeyIndexLocked(BlockKey key)
+	{
+		if (_keysByFile.TryGetValue(key.RelativePath, out HashSet<BlockKey>? set))
+		{
+			set.Remove(key);
+			if (set.Count == 0)
+			{
+				_keysByFile.Remove(key.RelativePath);
+			}
+		}
+	}
+
+	private void UpdateDirtyIndexOnStateChangeLocked(BlockKey key, bool wasDirty, bool isNowDirty, int validLen)
+	{
+		if (!wasDirty && isNowDirty)
+		{
+			_dirtyCount++;
+			SetDirtyIndexLocked(key, validLen);
+		}
+		else if (wasDirty && !isNowDirty)
+		{
+			_dirtyCount = Math.Max(0, _dirtyCount - 1);
+			RemoveDirtyIndexLocked(key);
+		}
+		else if (isNowDirty)
+		{
+			SetDirtyIndexLocked(key, validLen);
+		}
+	}
+
+	private void SetDirtyIndexLocked(BlockKey key, int validLen)
+	{
+		if (!_dirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map))
+		{
+			map = new Dictionary<long, int>();
+			_dirtyBlocksByFile[key.RelativePath] = map;
+		}
+		map[key.BlockIndex] = validLen;
+		long end = key.BlockIndex * _blockSize + validLen;
+		if (!_dirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) || end > curMax)
+		{
+			_dirtyMaxEndByFile[key.RelativePath] = end;
+		}
+		else
+		{
+			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
+		}
+	}
+
+	private void RemoveDirtyIndexLocked(BlockKey key)
+	{
+		if (!_dirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map))
+		{
+			return;
+		}
+		map.Remove(key.BlockIndex);
+		if (map.Count == 0)
+		{
+			_dirtyBlocksByFile.Remove(key.RelativePath);
+			_dirtyMaxEndByFile.Remove(key.RelativePath);
+		}
+		else
+		{
+			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
+		}
+	}
+
+	private void RecomputeDirtyMaxEndLocked(string relPath, Dictionary<long, int> map)
+	{
+		long max = 0;
+		foreach (KeyValuePair<long, int> kv in map)
+		{
+			long end = kv.Key * _blockSize + kv.Value;
+			if (end > max)
+			{
+				max = end;
+			}
+		}
+		_dirtyMaxEndByFile[relPath] = max;
 	}
 }

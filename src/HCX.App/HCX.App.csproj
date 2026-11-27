@@ -9,7 +9,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\hcx.ico</ApplicationIcon>
     <AssemblyName>HCX.App</AssemblyName>
-    <Version>2.1.0</Version>
+    <Version>2.1.1</Version>
   </PropertyGroup>
 
   <ItemGroup>

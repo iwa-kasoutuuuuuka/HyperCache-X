@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Linq;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Win32;
 
@@ -25,12 +27,13 @@ public sealed class AppSettings
 
 /// <summary>
 /// Persists HyperCache X user configuration atomically in %LOCALAPPDATA%\HyperCacheX\settings.json
-/// and manages HKCU Run startup registration.
+/// and manages HKCU Run startup registration with strict path/value sanitization.
 /// </summary>
 public static class AppSettingsManager
 {
 	private const string RunSubKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
 	private const string RunValueName = "HyperCacheX";
+	private const long MaxCacheSizeMb = 1_048_576; // 1 TB upper clamp
 
 	private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
 	{
@@ -56,7 +59,8 @@ public static class AppSettingsManager
 			{
 				return new AppSettings();
 			}
-			return JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
+			AppSettings? loaded = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions);
+			return loaded == null ? new AppSettings() : Sanitize(loaded);
 		}
 		catch
 		{
@@ -70,6 +74,7 @@ public static class AppSettingsManager
 		{
 			throw new ArgumentNullException(nameof(settings));
 		}
+		AppSettings sanitized = Sanitize(settings);
 		string target = string.IsNullOrWhiteSpace(path) ? DefaultSettingsPath : path;
 		string? dir = Path.GetDirectoryName(target);
 		if (!string.IsNullOrEmpty(dir))
@@ -77,9 +82,38 @@ public static class AppSettingsManager
 			Directory.CreateDirectory(dir);
 		}
 		string temp = target + ".tmp";
-		string json = JsonSerializer.Serialize(settings, JsonOptions);
+		string json = JsonSerializer.Serialize(sanitized, JsonOptions);
 		File.WriteAllText(temp, json);
 		File.Move(temp, target, overwrite: true);
+	}
+
+	public static AppSettings Sanitize(AppSettings raw)
+	{
+		string l1Mode = Enum.TryParse<L1BackendMode>(raw.L1BackendMode, ignoreCase: true, out L1BackendMode parsedL1)
+			? parsedL1.ToString()
+			: nameof(HCX.Core.L1BackendMode.AutoPreferRamDisk);
+
+		string writePolicy = Enum.TryParse<WritePolicy>(raw.WritePolicy, ignoreCase: true, out WritePolicy parsedPolicy)
+			? parsedPolicy.ToString()
+			: nameof(HCX.Core.WritePolicy.WriteBack);
+
+		return new AppSettings
+		{
+			TargetPath = SanitizeFsDirectory(raw.TargetPath, forbidInternalHcx: true),
+			L1BackendMode = l1Mode,
+			RamSizeMb = Math.Clamp(raw.RamSizeMb, 0L, MaxCacheSizeMb),
+			PreferredRamDiskRoot = SanitizeFsDirectory(raw.PreferredRamDiskRoot, forbidInternalHcx: false),
+			SsdRoot = SanitizeFsDirectory(raw.SsdRoot, forbidInternalHcx: false),
+			SsdSizeMb = Math.Clamp(raw.SsdSizeMb, 0L, MaxCacheSizeMb),
+			WritePolicy = writePolicy,
+			MountPoint = SanitizeMountPoint(raw.MountPoint),
+			PerformanceModeIndex = Math.Clamp(raw.PerformanceModeIndex, 0, 2),
+			RamDiskMountPoint = SanitizeMountPoint(raw.RamDiskMountPoint),
+			RamDiskCapacityMb = Math.Clamp(raw.RamDiskCapacityMb, 0L, MaxCacheSizeMb),
+			RamDiskLabel = SanitizeLabel(raw.RamDiskLabel),
+			AutoStartWithWindows = raw.AutoStartWithWindows,
+			AutoRestoreSession = raw.AutoRestoreSession
+		};
 	}
 
 	public static bool IsWindowsAutoStartEnabled()
@@ -109,11 +143,11 @@ public static class AppSettingsManager
 				string path = string.IsNullOrWhiteSpace(exePath)
 					? (Environment.ProcessPath ?? string.Empty)
 					: exePath;
-				if (string.IsNullOrWhiteSpace(path))
+				if (!TryValidateExecutablePath(path, out string normalizedPath))
 				{
 					return false;
 				}
-				key.SetValue(RunValueName, $"\"{path}\" --minimized");
+				key.SetValue(RunValueName, $"\"{normalizedPath}\" --minimized");
 			}
 			else
 			{
@@ -125,5 +159,84 @@ public static class AppSettingsManager
 		{
 			return false;
 		}
+	}
+
+	private static bool TryValidateExecutablePath(string path, out string normalizedPath)
+	{
+		normalizedPath = string.Empty;
+		if (string.IsNullOrWhiteSpace(path) ||
+		    path.IndexOf('"') >= 0 ||
+		    path.Any(char.IsControl) ||
+		    !Path.IsPathRooted(path))
+		{
+			return false;
+		}
+		try
+		{
+			normalizedPath = Path.GetFullPath(path);
+			return !string.IsNullOrWhiteSpace(normalizedPath) && !normalizedPath.StartsWith(@"\\", StringComparison.Ordinal);
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private static string? SanitizeFsDirectory(string? path, bool forbidInternalHcx)
+	{
+		if (string.IsNullOrWhiteSpace(path) ||
+		    path.IndexOf('\0') >= 0 ||
+		    path.Any(char.IsControl) ||
+		    path.StartsWith(@"\\.\", StringComparison.Ordinal) ||
+		    path.StartsWith(@"\\?\", StringComparison.Ordinal))
+		{
+			return null;
+		}
+		string trimmed = path.Trim();
+		if (forbidInternalHcx)
+		{
+			string norm = trimmed.TrimEnd('\\');
+			if (Path.GetFileName(norm).Equals(".hcx", StringComparison.OrdinalIgnoreCase) ||
+			    norm.Contains(@"\.hcx\", StringComparison.OrdinalIgnoreCase))
+			{
+				return null;
+			}
+		}
+		return trimmed;
+	}
+
+	private static string? SanitizeMountPoint(string? mount)
+	{
+		if (string.IsNullOrWhiteSpace(mount) || mount.Any(char.IsControl))
+		{
+			return null;
+		}
+		string trimmed = mount.Trim();
+		if (trimmed.Length == 2 && char.IsLetter(trimmed[0]) && trimmed[1] == ':')
+		{
+			return $"{char.ToUpperInvariant(trimmed[0])}:";
+		}
+		return trimmed.Length <= 64 ? trimmed : trimmed.Substring(0, 64);
+	}
+
+	private static string SanitizeLabel(string? label)
+	{
+		if (string.IsNullOrWhiteSpace(label))
+		{
+			return "HCX_RAMDISK";
+		}
+		StringBuilder sb = new StringBuilder(32);
+		foreach (char c in label.Trim())
+		{
+			if (!char.IsControl(c))
+			{
+				sb.Append(c);
+				if (sb.Length >= 32)
+				{
+					break;
+				}
+			}
+		}
+		return sb.Length > 0 ? sb.ToString() : "HCX_RAMDISK";
 	}
 }

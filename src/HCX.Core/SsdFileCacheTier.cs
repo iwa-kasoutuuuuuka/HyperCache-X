@@ -823,6 +823,18 @@ public sealed class SsdFileCacheTier : IDisposable
 		{
 			return 0;
 		}
+		try
+		{
+			if ((File.GetAttributes(cacheDirectory) & FileAttributes.ReparsePoint) != 0)
+			{
+				return 0;
+			}
+		}
+		catch
+		{
+			return 0;
+		}
+
 		int deleted = 0;
 		string[] patterns = string.IsNullOrWhiteSpace(instanceId)
 			? new[] { "cache_*.bin", "cache_metadata_*.dat", "cache_metadata_*.dat.tmp" }
@@ -834,6 +846,10 @@ public sealed class SsdFileCacheTier : IDisposable
 			{
 				try
 				{
+					if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0)
+					{
+						continue;
+					}
 					File.Delete(file);
 					deleted++;
 				}

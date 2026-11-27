@@ -1242,65 +1242,72 @@ public sealed class HybridCacheEngine : IDisposable
 			ReaderWriterLockSlim evLock = GetFileLock(evKey.RelativePath);
 			List<(BlockKey Key, InFlightEvictionEntry Entry)>? extraSsdEvictions = null;
 
-			evLock.EnterWriteLock();
 			try
 			{
-				if (!entry.IsDirty)
+				evLock.EnterWriteLock();
+				try
 				{
-					if (_ssd.IsEnabled && !_ram.TryReadSlice(evKey, 0, Span<byte>.Empty, entry.BackingFileSize, entry.BackingLastWriteUtcTicks, out _, out _, out _))
+					if (!entry.IsDirty)
 					{
-						string evFull = ResolveBackingPath(evKey.RelativePath);
-						(bool exists, long ns, long nt) = RefreshBackingInfoLocked(evKey.RelativePath, evFull, null);
-						if (exists && ns == entry.BackingFileSize && nt == entry.BackingLastWriteUtcTicks && !_ssd.ContainsFresh(evKey, ns, nt))
+						if (_ssd.IsEnabled && !_ram.TryReadSlice(evKey, 0, Span<byte>.Empty, entry.BackingFileSize, entry.BackingLastWriteUtcTicks, out _, out _, out _))
 						{
-							PutInSsdWithDeferredFlush(
+							string evFull = ResolveBackingPath(evKey.RelativePath);
+							(bool exists, long ns, long nt) = RefreshBackingInfoLocked(evKey.RelativePath, evFull, null);
+							if (exists && ns == entry.BackingFileSize && nt == entry.BackingLastWriteUtcTicks && !_ssd.ContainsFresh(evKey, ns, nt))
+							{
+								PutInSsdWithDeferredFlush(
+									evKey,
+									entry.Data,
+									entry.ValidLength,
+									isDirty: false,
+									entry.BackingFileSize,
+									entry.BackingLastWriteUtcTicks,
+									entry.AiScore,
+									ref extraSsdEvictions);
+							}
+						}
+					}
+					else if (_inFlightEvictions.TryGetValue(evKey, out InFlightEvictionEntry? current) && ReferenceEquals(current, entry))
+					{
+						bool handled = false;
+						if (entry.TrySsdDemote && _ssd.IsEnabled)
+						{
+							if (PutInSsdWithDeferredFlush(
 								evKey,
 								entry.Data,
 								entry.ValidLength,
-								isDirty: false,
+								isDirty: true,
 								entry.BackingFileSize,
 								entry.BackingLastWriteUtcTicks,
 								entry.AiScore,
-								ref extraSsdEvictions);
+								ref extraSsdEvictions))
+							{
+								_inFlightEvictions.TryRemove(new KeyValuePair<BlockKey, InFlightEvictionEntry>(evKey, entry));
+								handled = true;
+							}
+						}
+
+						if (!handled)
+						{
+							string evFull = ResolveBackingPath(evKey.RelativePath);
+							WriteBackingRangeLocked(evFull, null, evKey.BlockIndex * _blockSize, entry.Data.AsSpan(0, entry.ValidLength));
+							_inFlightEvictions.TryRemove(new KeyValuePair<BlockKey, InFlightEvictionEntry>(evKey, entry));
+
+							(_, long ns, long nt) = RefreshBackingInfoLocked(evKey.RelativePath, evFull, null);
+							_ram.UpdateBackingMetadataForFile(evKey.RelativePath, ns, nt);
+							_ssd.UpdateBackingMetadataForFile(evKey.RelativePath, ns, nt);
+							_scorer.UpdateTierState(evKey, CacheTier.None, false);
 						}
 					}
 				}
-				else if (_inFlightEvictions.TryGetValue(evKey, out InFlightEvictionEntry? current) && ReferenceEquals(current, entry))
+				finally
 				{
-					bool handled = false;
-					if (entry.TrySsdDemote && _ssd.IsEnabled)
-					{
-						if (PutInSsdWithDeferredFlush(
-							evKey,
-							entry.Data,
-							entry.ValidLength,
-							isDirty: true,
-							entry.BackingFileSize,
-							entry.BackingLastWriteUtcTicks,
-							entry.AiScore,
-							ref extraSsdEvictions))
-						{
-							_inFlightEvictions.TryRemove(new KeyValuePair<BlockKey, InFlightEvictionEntry>(evKey, entry));
-							handled = true;
-						}
-					}
-
-					if (!handled)
-					{
-						string evFull = ResolveBackingPath(evKey.RelativePath);
-						WriteBackingRangeLocked(evFull, null, evKey.BlockIndex * _blockSize, entry.Data.AsSpan(0, entry.ValidLength));
-						_inFlightEvictions.TryRemove(new KeyValuePair<BlockKey, InFlightEvictionEntry>(evKey, entry));
-
-						(_, long ns, long nt) = RefreshBackingInfoLocked(evKey.RelativePath, evFull, null);
-						_ram.UpdateBackingMetadataForFile(evKey.RelativePath, ns, nt);
-						_ssd.UpdateBackingMetadataForFile(evKey.RelativePath, ns, nt);
-						_scorer.UpdateTierState(evKey, CacheTier.None, false);
-					}
+					evLock.ExitWriteLock();
 				}
 			}
-			finally
+			catch (Exception ex)
 			{
-				evLock.ExitWriteLock();
+				Log($"[警告] 退避フラッシュ失敗 ({evKey}): {ex.Message}");
 			}
 
 			if (extraSsdEvictions != null)

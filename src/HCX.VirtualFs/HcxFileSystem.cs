@@ -312,7 +312,7 @@ public sealed class HcxFileSystem : FileSystemBase
 		out uint bytesTransferred)
 	{
 		FileDesc desc = (FileDesc)fileDescObj;
-		if (offset > (ulong)long.MaxValue)
+		if (offset > (ulong)long.MaxValue || (length > 0 && buffer == IntPtr.Zero))
 		{
 			ThrowIoExceptionWithWin32(87); // ERROR_INVALID_PARAMETER
 		}
@@ -322,11 +322,12 @@ public sealed class HcxFileSystem : FileSystemBase
 			return STATUS_SUCCESS;
 		}
 
+		FileStream? stream = desc.Stream;
 		int readLen = (int)Math.Min((uint)int.MaxValue, length);
 		unsafe
 		{
 			Span<byte> destSpan = new Span<byte>(buffer.ToPointer(), readLen);
-			int actual = _engine.ReadBlockRange(desc.RelativePath, (long)offset, destSpan, desc.Stream);
+			int actual = _engine.ReadBlockRange(desc.RelativePath, (long)offset, destSpan, stream);
 			if (actual <= 0)
 			{
 				bytesTransferred = 0;
@@ -349,7 +350,12 @@ public sealed class HcxFileSystem : FileSystemBase
 		out FileInfo fileInfo)
 	{
 		FileDesc desc = (FileDesc)fileDescObj;
-		long currentSize = _engine.GetEffectiveFileSize(desc.RelativePath, desc.Stream);
+		if (length > 0 && buffer == IntPtr.Zero)
+		{
+			ThrowIoExceptionWithWin32(87); // ERROR_INVALID_PARAMETER
+		}
+		FileStream? stream = desc.Stream;
+		long currentSize = _engine.GetEffectiveFileSize(desc.RelativePath, stream);
 
 		if (constrainedIo)
 		{
@@ -378,7 +384,7 @@ public sealed class HcxFileSystem : FileSystemBase
 		unsafe
 		{
 			ReadOnlySpan<byte> srcSpan = new ReadOnlySpan<byte>(buffer.ToPointer(), (int)length);
-			int written = _engine.WriteBlockRange(desc.RelativePath, (long)writeOffset, srcSpan, desc.Stream);
+			int written = _engine.WriteBlockRange(desc.RelativePath, (long)writeOffset, srcSpan, stream);
 			bytesTransferred = (uint)written;
 			return GetFileInfoInternal(desc, out fileInfo);
 		}
@@ -393,8 +399,9 @@ public sealed class HcxFileSystem : FileSystemBase
 			return STATUS_SUCCESS;
 		}
 		FileDesc desc = (FileDesc)fileDescObj;
-		_engine.FlushFile(desc.RelativePath, desc.Stream);
-		desc.Stream?.Flush(flushToDisk: true);
+		FileStream? stream = desc.Stream;
+		_engine.FlushFile(desc.RelativePath, stream);
+		stream?.Flush(flushToDisk: true);
 		return GetFileInfoInternal(desc, out fileInfo);
 	}
 
@@ -431,13 +438,14 @@ public sealed class HcxFileSystem : FileSystemBase
 		{
 			ThrowIoExceptionWithWin32(87);
 		}
-		if (desc.Stream != null)
+		FileStream? stream = desc.Stream;
+		if (stream != null)
 		{
-			long effectiveSize = _engine.GetEffectiveFileSize(desc.RelativePath, desc.Stream);
+			long effectiveSize = _engine.GetEffectiveFileSize(desc.RelativePath, stream);
 			if (!setAllocationSize || (ulong)effectiveSize > newSize)
 			{
-				_engine.FlushFile(desc.RelativePath, desc.Stream);
-				desc.Stream.SetLength((long)newSize);
+				_engine.FlushFile(desc.RelativePath, stream);
+				stream.SetLength((long)newSize);
 				_engine.TruncateFile(desc.RelativePath, (long)newSize);
 			}
 		}

@@ -60,6 +60,7 @@ public partial class MainWindow : Window
 	private ToolStripItem? _trayStopItem;
 	private bool _isExplicitExit;
 	private int _shutdownExecuted;
+	private int _initStarted;
 	private string? _customTargetFolder;
 	private List<DiskInfo> _cachedDisks = new List<DiskInfo>();
 	private AppSettings _settings = new AppSettings();
@@ -79,7 +80,6 @@ public partial class MainWindow : Window
 
 		StateChanged += OnStateChanged;
 		Closing += OnWindowClosing;
-		Loaded += OnWindowLoaded;
 		SystemEvents.SessionEnding += OnSystemSessionEnding;
 
 		if (_startMinimized)
@@ -88,11 +88,17 @@ public partial class MainWindow : Window
 			Hide();
 		}
 
-		Log("HyperCache X v2.1 起動中 (ディスク情報を非同期読み込みしています)...");
+		Log("HyperCache X v2.1.1 起動中 (ディスク情報を非同期読み込みしています)...");
+		Dispatcher.BeginInvoke(() => _ = InitializeAsync(), DispatcherPriority.Loaded);
 	}
 
-	private async void OnWindowLoaded(object sender, RoutedEventArgs e)
+	private async Task InitializeAsync()
 	{
+		if (Interlocked.Exchange(ref _initStarted, 1) != 0)
+		{
+			return;
+		}
+
 		_settings = AppSettingsManager.Load();
 		ChkAutoRestore.IsChecked = _settings.AutoRestoreSession;
 		ChkAutoStartWindows.IsChecked = AppSettingsManager.IsWindowsAutoStartEnabled();
@@ -100,7 +106,7 @@ public partial class MainWindow : Window
 		await RefreshDisksAndOptionsAsync();
 
 		ApplySavedSettingsToUi(_settings);
-		Log("HyperCache X v2.1 準備完了 (既存RAMDisk優先 L1 + 永続L2 SSD + 内蔵RAMディスク)。");
+		Log("HyperCache X v2.1.1 準備完了 (既存RAMDisk優先 L1 + 永続L2 SSD + 内蔵RAMディスク)。");
 
 		DiskInfo? preferredRam = DiskUtility.FindPreferredRamDisk(_cachedDisks);
 		if (preferredRam != null)
@@ -1051,7 +1057,7 @@ public partial class MainWindow : Window
 		}
 		if (_notifyIcon != null)
 		{
-			_notifyIcon.Text = "HyperCache X v2.1 - 準備完了";
+			_notifyIcon.Text = "HyperCache X v2.1.1 - 準備完了";
 		}
 		Log("すべての仮想ドライブを安全にアンマウントし、HDD 同期を完了しました。");
 	}
@@ -1066,12 +1072,20 @@ public partial class MainWindow : Window
 		string line = $"[{DateTime.Now:HH:mm:ss}] {message}";
 		Dispatcher.BeginInvoke(() =>
 		{
-			_logLines.Enqueue(line);
-			while (_logLines.Count > MaxLogLines)
+			if (_logLines.Count < MaxLogLines)
 			{
-				_logLines.Dequeue();
+				_logLines.Enqueue(line);
+				LogOutput.AppendText(line + "\n");
 			}
-			LogOutput.Text = string.Join("\n", _logLines) + "\n";
+			else
+			{
+				_logLines.Enqueue(line);
+				while (_logLines.Count > MaxLogLines)
+				{
+					_logLines.Dequeue();
+				}
+				LogOutput.Text = string.Join("\n", _logLines) + "\n";
+			}
 			LogScroller.ScrollToEnd();
 		});
 	}

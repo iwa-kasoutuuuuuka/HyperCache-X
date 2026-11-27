@@ -785,10 +785,18 @@ public sealed class RamDiskFileCacheTier : IL1CacheTier
 		int removed = 0;
 		try
 		{
+			if ((File.GetAttributes(ramDiskDirectory) & FileAttributes.ReparsePoint) != 0)
+			{
+				return 0;
+			}
 			foreach (string file in Directory.EnumerateFiles(ramDiskDirectory, "l1_cache_*.bin", SearchOption.TopDirectoryOnly))
 			{
 				try
 				{
+					if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0)
+					{
+						continue;
+					}
 					File.Delete(file);
 					removed++;
 				}

@@ -247,4 +247,132 @@ public sealed class SecurityAndCoherenceTests : IDisposable
 			store.SetSecurity(@"\file.bin", AccessControlSections.Access, new byte[] { 0xFF, 0x00, 0x01 }));
 		Assert.Equal(unchecked((int)0x8007053A), badSd.HResult);
 	}
+
+	[Fact]
+	public void HcxFileSystem_And_MemoryFileSystem_RejectNullNativeBufferOnReadWrite()
+	{
+		using HybridCacheEngine engine = new HybridCacheEngine(new CacheOptions
+		{
+			TargetRootPath = _targetDir,
+			SsdCacheDirectory = _ssdDir,
+			RamCacheSizeBytes = 65536 * 2,
+			SsdCacheSizeBytes = 65536 * 2
+		});
+		HcxFileSystem fs = new HcxFileSystem(engine);
+		fs.Create(@"\nullbuf.bin", 0, 0x40000000, (uint)FileAttributes.Archive, null!, 0, out object node, out object desc, out _, out _);
+		try
+		{
+			IOException exRead = Assert.Throws<IOException>(() => fs.Read(node, desc, IntPtr.Zero, 0, 16, out _));
+			Assert.Equal(unchecked((int)0x80070057), exRead.HResult);
+			IOException exWrite = Assert.Throws<IOException>(() => fs.Write(node, desc, IntPtr.Zero, 0, 16, false, false, out _, out _));
+			Assert.Equal(unchecked((int)0x80070057), exWrite.HResult);
+		}
+		finally
+		{
+			fs.Close(node, desc);
+		}
+
+		InMemoryVolumeStore store = new InMemoryVolumeStore(1024 * 1024);
+		MemoryFileSystem mfs = new MemoryFileSystem(store);
+		mfs.Create(@"\memnull.bin", 0, 0x40000000, (uint)FileAttributes.Archive, null!, 0, out object mNode, out object mDesc, out _, out _);
+		IOException mRead = Assert.Throws<IOException>(() => mfs.Read(mNode, mDesc, IntPtr.Zero, 0, 16, out _));
+		Assert.Equal(unchecked((int)0x80070057), mRead.HResult);
+		IOException mWrite = Assert.Throws<IOException>(() => mfs.Write(mNode, mDesc, IntPtr.Zero, 0, 16, false, false, out _, out _));
+		Assert.Equal(unchecked((int)0x80070057), mWrite.HResult);
+		mfs.Close(mNode, mDesc);
+	}
+
+	[Fact]
+	public void DrainDeferredEvictions_IsolatesBackingIoFailure_WithoutCrashingUnrelatedCaller()
+	{
+		const int blockSize = 4096;
+		// Force a directory at the backing path of victim.bin so opening it as a file fails during eviction flush.
+		Directory.CreateDirectory(Path.Combine(_targetDir, "victim.bin"));
+
+		using HybridCacheEngine engine = new HybridCacheEngine(new CacheOptions
+		{
+			TargetRootPath = _targetDir,
+			SsdCacheDirectory = _ssdDir,
+			BlockSizeBytes = blockSize,
+			RamCacheSizeBytes = blockSize, // 1 block L1
+			SsdCacheSizeBytes = 0,         // L2 off so eviction tries direct HDD flush
+			WritePolicy = WritePolicy.WriteBack,
+			FlushInterval = TimeSpan.FromMinutes(10)
+		});
+		Assert.True(engine.Start());
+
+		byte[] victimPayload = Enumerable.Repeat((byte)0x5A, blockSize).ToArray();
+		engine.WriteBlockRange("victim.bin", 0, victimPayload);
+
+		// Writing an unrelated file evicts victim.bin; DrainDeferredEvictions must catch backing failure without throwing here.
+		byte[] otherPayload = Enumerable.Repeat((byte)0xA5, blockSize).ToArray();
+		int written = engine.WriteBlockRange("healthy.bin", 0, otherPayload);
+		Assert.Equal(blockSize, written);
+
+		byte[] readHealthy = new byte[blockSize];
+		Assert.Equal(blockSize, engine.ReadBlockRange("healthy.bin", 0, readHealthy));
+		Assert.True(readHealthy.AsSpan().SequenceEqual(otherPayload));
+
+		// Victim stays in _inFlightEvictions and remains readable despite backing failure.
+		Assert.True(engine.GetStatsSnapshot().DirtyBlocks >= 1);
+		byte[] readVictim = new byte[blockSize];
+		Assert.Equal(blockSize, engine.ReadBlockRange("victim.bin", 0, readVictim));
+		Assert.True(readVictim.AsSpan().SequenceEqual(victimPayload));
+
+		// Remove the directory blocker so Dispose/SyncAll can flush cleanly without lingering test state.
+		Directory.Delete(Path.Combine(_targetDir, "victim.bin"));
+		engine.SyncAll();
+	}
+
+	[Fact]
+	public void AppSettingsManager_SanitizesTamperedJson_AndRejectsUnsafeAutoStartPath()
+	{
+		string path = Path.Combine(_tempRoot, "tampered.json");
+		string tamperedJson = """
+		{
+		  "TargetPath": "\\\\.\\PhysicalDrive0",
+		  "L1BackendMode": "BogusMode",
+		  "RamSizeMb": -500,
+		  "PreferredRamDiskRoot": "\\\\?\\Volume{1234}",
+		  "SsdRoot": "C:\\.hcx_bad\u0000null",
+		  "SsdSizeMb": 99999999,
+		  "WritePolicy": "EvilPolicy",
+		  "PerformanceModeIndex": 42,
+		  "RamDiskLabel": "BAD\n\r\tLABEL_123456789012345678901234567890"
+		}
+		""";
+		File.WriteAllText(path, tamperedJson);
+
+		AppSettings loaded = AppSettingsManager.Load(path);
+		Assert.Null(loaded.TargetPath);
+		Assert.Null(loaded.PreferredRamDiskRoot);
+		Assert.Null(loaded.SsdRoot);
+		Assert.Equal(nameof(L1BackendMode.AutoPreferRamDisk), loaded.L1BackendMode);
+		Assert.Equal(nameof(WritePolicy.WriteBack), loaded.WritePolicy);
+		Assert.Equal(0L, loaded.RamSizeMb);
+		Assert.Equal(1_048_576L, loaded.SsdSizeMb);
+		Assert.Equal(2, loaded.PerformanceModeIndex);
+		Assert.True(loaded.RamDiskLabel.Length <= 32);
+		Assert.DoesNotContain("\n", loaded.RamDiskLabel);
+
+		Assert.False(AppSettingsManager.SetWindowsAutoStart(true, @"C:\bad""quote\HCX.App.exe"));
+		Assert.False(AppSettingsManager.SetWindowsAutoStart(true, "relative.exe"));
+		Assert.False(AppSettingsManager.SetWindowsAutoStart(true, @"\\unc\share\HCX.App.exe"));
+	}
+
+	[Fact]
+	public void LiveRamDiskCacheBenchmark_WhenRamDiskExists_VerifiesDataIntegrity()
+	{
+		DiskInfo? ramDisk = DiskUtility.FindPreferredRamDisk();
+		BenchmarkResult result = CacheBenchmarkRunner.Run(
+			_targetDir,
+			_ssdDir,
+			32L * 1024 * 1024,
+			64L * 1024 * 1024,
+			null,
+			ramDisk?.RootPath);
+
+		Assert.True(result.VerifiedIntegrity);
+		Assert.True(result.RamHits > 0);
+	}
 }

@@ -180,6 +180,10 @@ public sealed class MemoryFileSystem : FileSystemBase
 		out uint bytesTransferred)
 	{
 		MemDesc desc = (MemDesc)fileDescObj;
+		if (length > 0 && buffer == IntPtr.Zero)
+		{
+			throw new IOException("Invalid buffer pointer.", unchecked((int)0x80070057));
+		}
 		if (length > (uint)int.MaxValue)
 		{
 			length = int.MaxValue;
@@ -210,6 +214,10 @@ public sealed class MemoryFileSystem : FileSystemBase
 		out FileInfo fileInfo)
 	{
 		MemDesc desc = (MemDesc)fileDescObj;
+		if (length > 0 && buffer == IntPtr.Zero)
+		{
+			throw new IOException("Invalid buffer pointer.", unchecked((int)0x80070057));
+		}
 		if (length > (uint)int.MaxValue)
 		{
 			length = int.MaxValue;

@@ -1,10 +1,16 @@
-# HyperCache X (HCX) v2.1
+# HyperCache X (HCX) v2.1.1
 
 低速な HDD の I/O を、**Tier 1 (既存 RAMDisk 優先 / プロセス内 RAM) + Tier 2 (高速 SSD 上の専用キャッシュファイル)** の 3 階層ハイブリッドキャッシュで安全に高速化する Windows 向けユーザーモード・ストレージ加速エンジン＋仮想 RAM ディスクツールです。
 
 ---
 
-## v2.1 の主な機能・強化ポイント
+## v2.1.1 の主な機能・強化ポイント
+
+- **v2.1.1 デバッグ・セキュリティハードニング（動作／脆弱性監査反映）**:
+  - **Eviction 例外分離**: `DrainDeferredEvictions` のアイテム単位で I/O 例外を分離し、別ファイルのバックエンド書込失敗で呼び出し元が異常終了しないよう保護（失敗ブロックは `_inFlightEvictions` に安全保持され次回 `SyncAll()` で再試行）。
+  - **Reparse Point（ジャンクション／シンボリックリンク）防御**: 孤立 L1 キャッシュ掃除 (`CleanupOrphanCacheFiles`) および L2 キャッシュ削除 (`DeleteCacheFiles`) で `FileAttributes.ReparsePoint` をスキップし、リンク悪用による意図しないファイル削除を防止。
+  - **設定・スタートアップ登録サニタイズ (`AppSettingsManager`)**: 改ざんされた `settings.json` からの生デバイスパス (`\\.\` / `\\?\`)・負値／過大サイズ・制御文字をロード時に無害化し、HKCU `Run` 登録時は引用符／制御文字／UNC パス／相対パスを拒否。
+  - **WinFsp ネイティブポインタ安全性・トレイ常駐修正**: `HcxFileSystem` / `MemoryFileSystem` の `IntPtr.Zero` 防御と `FileStream` ローカル捕捉、さらに `--minimized` 起動時に初期化・`AutoRestoreSession` が動作しない WPF `Loaded` イベント不具合を `DispatcherPriority.Loaded` 実行へ修正。
 
 - **3階層ハイブリッドアーキテクチャ（既存 RAMDisk 優先対応）**:
   - **Tier 1 (L1 RAM / 既存 RAMDisk)**: `AutoPreferRamDisk` モードにより、PC 上に既存の RAMDisk（例: `R:\`）が存在する場合は優先して L1 キャッシュ（`.hcx\l1_cache_{id}.bin`）に利用し、無ければプロセス内 RAM を自動使用します（上限設定可: 256 MB 〜 16 GB）。起動時に残存する孤立 `l1_cache_*.bin` ファイルも自動掃除します。
@@ -45,7 +51,7 @@
 - [`src/HCX.Core`](src/HCX.Core/HCX.Core.csproj): 3 階層キャッシュエンジン・設定管理 (`HybridCacheEngine`, `IL1CacheTier`, `RamCacheTier`, `RamDiskFileCacheTier`, `SsdFileCacheTier`, `AiAccessScorer`, `MetadataManager`, `AppSettingsManager`, `DiskUtility`, `CacheBenchmarkRunner`)
 - [`src/HCX.VirtualFs`](src/HCX.VirtualFs/HCX.VirtualFs.csproj): WinFsp 連携仮想ファイルシステム (`HcxFileSystem`, `VirtualDriveHost`, `InMemoryVolumeStore`, `MemoryFileSystem`, `RamDiskHost`, `WinFspRuntime`)
 - [`src/HCX.App`](src/HCX.App/HCX.App.csproj): ダークモード WPF ダッシュボード（ハイブリッド加速 / 内蔵 RAM ディスクの 2 タブ構成、リアルタイム 32×8 ヒートマップ、トレイ常駐 UI、設定自動保存・L2 キャッシュ消去）
-- [`tests/HCX.Tests`](tests/HCX.Tests/HCX.Tests.csproj): xUnit 自動テストスイート（機能・永続化・整合性・セキュリティ・並列追い出しストレステスト **42 件**）
+- [`tests/HCX.Tests`](tests/HCX.Tests/HCX.Tests.csproj): xUnit 自動テストスイート（機能・永続化・整合性・セキュリティ・並列追い出し・実機 `R:\` RAMDisk ベンチマークテスト **46 件**）
 - [`scripts/build-release.ps1`](scripts/build-release.ps1): テスト実行＋自己完結型 (`win-x64`) リリース ZIP・`SHA256SUMS.txt` 生成スクリプト
 
 ---
@@ -66,10 +72,10 @@
 
 ---
 
-## ビルド・テスト・配布パッケージ作成 (v2.1)
+## ビルド・テスト・配布パッケージ作成 (v2.1.1)
 
 - **ビルド**: `Debug` / `Release` ともに **0 警告 / 0 エラー**
-- **自動テスト**: `dotnet test HCX.sln -c Release --no-build` — **42 / 42 件合格**（ホスト環境に WinFsp 未導入時は実マウント E2E を安全スキップ）
+- **自動テスト**: `dotnet test HCX.sln -c Release --no-build` — **46 / 46 件合格**（実機 `R:\` RAMDisk 整合性ベンチマーク含む。ホスト環境に WinFsp 未導入時は実マウント E2E を安全スキップ）
 - **依存関係脆弱性**: `dotnet list HCX.sln package --vulnerable --include-transitive` — **0 件**
 
 ### ビルド・テスト・パッケージ生成手順

@@ -86,6 +86,7 @@ public sealed class SsdFileCacheTier : IDisposable
 				FileAccess.ReadWrite,
 				FileShare.Read,
 				FileOptions.RandomAccess);
+			ShrinkFileIfNeededLocked();
 		}
 	}
 
@@ -216,7 +217,8 @@ public sealed class SsdFileCacheTier : IDisposable
 		long backingSize,
 		long backingTicks,
 		double aiScore,
-		out EvictedSsdBlock? evictedDirty)
+		out EvictedSsdBlock? evictedDirty,
+		Action<BlockKey, byte[], int>? onEvictDirty = null)
 	{
 		evictedDirty = null;
 		if (!IsEnabled || _handle == null)
@@ -275,6 +277,7 @@ public sealed class SsdFileCacheTier : IDisposable
 							Data = oldData,
 							ValidLength = victim.ValidLength
 						};
+						onEvictDirty?.Invoke(victim.Key, oldData, victim.ValidLength);
 					}
 				}
 				RemoveEntryLocked(victim, pushFreeSlot: false);
@@ -379,6 +382,7 @@ public sealed class SsdFileCacheTier : IDisposable
 					_freeSlots.Push(s);
 				}
 			}
+			ShrinkFileIfNeededLocked();
 		}
 		finally
 		{
@@ -813,6 +817,50 @@ public sealed class SsdFileCacheTier : IDisposable
 		}
 	}
 
+	public static int DeleteCacheFiles(string cacheDirectory, string? instanceId = null)
+	{
+		if (string.IsNullOrWhiteSpace(cacheDirectory) || !Directory.Exists(cacheDirectory))
+		{
+			return 0;
+		}
+		int deleted = 0;
+		string[] patterns = string.IsNullOrWhiteSpace(instanceId)
+			? new[] { "cache_*.bin", "cache_metadata_*.dat", "cache_metadata_*.dat.tmp" }
+			: new[] { $"cache_{instanceId}.bin", $"cache_metadata_{instanceId}.dat", $"cache_metadata_{instanceId}.dat.tmp" };
+
+		foreach (string pattern in patterns)
+		{
+			foreach (string file in Directory.EnumerateFiles(cacheDirectory, pattern, SearchOption.TopDirectoryOnly))
+			{
+				try
+				{
+					File.Delete(file);
+					deleted++;
+				}
+				catch (IOException)
+				{
+				}
+				catch (UnauthorizedAccessException)
+				{
+				}
+			}
+		}
+		return deleted;
+	}
+
+	private void ShrinkFileIfNeededLocked()
+	{
+		if (_handle == null || _maxSlots <= 0)
+		{
+			return;
+		}
+		long maxBytes = (long)_maxSlots * _blockSize;
+		if (_nextSlotToAllocate <= _maxSlots && RandomAccess.GetLength(_handle) > maxBytes)
+		{
+			RandomAccess.SetLength(_handle, maxBytes);
+		}
+	}
+
 	private void SetDirtyIndexLocked(BlockKey key, int validLen)
 	{
 		if (!_dirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map))
@@ -820,13 +868,15 @@ public sealed class SsdFileCacheTier : IDisposable
 			map = new Dictionary<long, int>();
 			_dirtyBlocksByFile[key.RelativePath] = map;
 		}
+		bool hadPrev = map.TryGetValue(key.BlockIndex, out int prevValidLen);
+		long prevEnd = hadPrev ? key.BlockIndex * _blockSize + prevValidLen : -1L;
 		map[key.BlockIndex] = validLen;
 		long end = key.BlockIndex * _blockSize + validLen;
 		if (!_dirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) || end > curMax)
 		{
 			_dirtyMaxEndByFile[key.RelativePath] = end;
 		}
-		else
+		else if (hadPrev && prevEnd >= curMax && end < prevEnd)
 		{
 			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
 		}
@@ -835,13 +885,14 @@ public sealed class SsdFileCacheTier : IDisposable
 	private void RemoveDirtyIndexLocked(BlockKey key)
 	{
 		if (!_dirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map)) return;
-		map.Remove(key.BlockIndex);
+		if (!map.Remove(key.BlockIndex, out int removedValidLen)) return;
 		if (map.Count == 0)
 		{
 			_dirtyBlocksByFile.Remove(key.RelativePath);
 			_dirtyMaxEndByFile.Remove(key.RelativePath);
 		}
-		else
+		else if (_dirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) &&
+		         key.BlockIndex * _blockSize + removedValidLen >= curMax)
 		{
 			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
 		}

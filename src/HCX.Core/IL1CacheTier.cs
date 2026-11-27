@@ -30,7 +30,8 @@ public interface IL1CacheTier : IDisposable
 		bool isDirty,
 		long backingSize,
 		long backingTicks,
-		double aiScore);
+		double aiScore,
+		Action<BlockKey, byte[], int>? onEvictDirty = null);
 
 	bool TryPatchOrGetForWrite(
 		BlockKey key,

@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using Fsp;
 using HCX.Core;
+using Microsoft.Win32.SafeHandles;
 using FileInfo = Fsp.Interop.FileInfo;
 using VolumeInfo = Fsp.Interop.VolumeInfo;
 
@@ -278,6 +279,7 @@ public sealed class HcxFileSystem : FileSystemBase
 			SetFileAttributesInternal(desc, GetFileAttributesInternal(desc) | fileAttributes | (uint)FileAttributes.Archive);
 		}
 		desc.Stream?.SetLength(0);
+		_engine.InvalidateBackingStatCache(desc.RelativePath);
 		return GetFileInfoInternal(desc, out fileInfo);
 	}
 
@@ -314,20 +316,13 @@ public sealed class HcxFileSystem : FileSystemBase
 		{
 			ThrowIoExceptionWithWin32(87); // ERROR_INVALID_PARAMETER
 		}
-		long effectiveSize = _engine.GetEffectiveFileSize(desc.RelativePath, desc.Stream);
-		if (offset >= (ulong)effectiveSize)
-		{
-			bytesTransferred = 0;
-			return STATUS_END_OF_FILE;
-		}
-
-		int readLen = (int)Math.Min((ulong)int.MaxValue, Math.Min((ulong)length, (ulong)effectiveSize - offset));
-		if (readLen == 0)
+		if (length == 0)
 		{
 			bytesTransferred = 0;
 			return STATUS_SUCCESS;
 		}
 
+		int readLen = (int)Math.Min((uint)int.MaxValue, length);
 		unsafe
 		{
 			Span<byte> destSpan = new Span<byte>(buffer.ToPointer(), readLen);
@@ -468,12 +463,27 @@ public sealed class HcxFileSystem : FileSystemBase
 		string oldFull = ToFullPath(fileName);
 		string newFull = ToFullPath(newFileName);
 
-		_engine.FlushFile(oldRel);
+		_engine.FlushPrefix(oldRel);
 		if (!MoveFileExW(oldFull, newFull, replaceIfExists ? 1U : 0U))
 		{
 			ThrowIoExceptionWithWin32(Marshal.GetLastWin32Error());
 		}
+		if (replaceIfExists && !string.Equals(oldRel, newRel, StringComparison.OrdinalIgnoreCase))
+		{
+			_engine.InvalidateFile(newRel);
+		}
 		_engine.NotifyRename(oldRel, newRel);
+
+		if (fileDescObj is FileDesc desc)
+		{
+			desc.FullPath = newFull;
+			desc.RelativePath = newRel;
+			if (desc.DirInfo != null)
+			{
+				desc.DirInfo = new DirectoryInfo(newFull);
+				desc.FileSystemInfos = null;
+			}
+		}
 		return STATUS_SUCCESS;
 	}
 
@@ -504,9 +514,10 @@ public sealed class HcxFileSystem : FileSystemBase
 		if ((sections & AccessControlSections.Access) != 0) secInfo |= 4;
 		if ((sections & AccessControlSections.Audit) != 0) secInfo |= 8;
 
-		if (desc.Stream != null)
+		FileStream? stream = desc.Stream;
+		if (stream != null)
 		{
-			if (!SetKernelObjectSecurity(desc.Stream.SafeFileHandle.DangerousGetHandle(), secInfo, securityDescriptor))
+			if (!SetKernelObjectSecurity(stream.SafeFileHandle, secInfo, securityDescriptor))
 			{
 				ThrowIoExceptionWithWin32(Marshal.GetLastWin32Error());
 			}
@@ -596,13 +607,14 @@ public sealed class HcxFileSystem : FileSystemBase
 
 	private int GetFileInfoInternal(FileDesc desc, out FileInfo fileInfo)
 	{
-		if (desc.Stream != null)
+		FileStream? stream = desc.Stream;
+		if (stream != null)
 		{
-			if (!GetFileInformationByHandle(desc.Stream.SafeFileHandle.DangerousGetHandle(), out BY_HANDLE_FILE_INFORMATION info))
+			if (!GetFileInformationByHandle(stream.SafeFileHandle, out BY_HANDLE_FILE_INFORMATION info))
 			{
 				ThrowIoExceptionWithWin32(Marshal.GetLastWin32Error());
 			}
-			long effectiveSize = _engine.GetEffectiveFileSize(desc.RelativePath, desc.Stream);
+			long effectiveSize = _engine.GetEffectiveFileSize(desc.RelativePath, stream);
 			fileInfo = new FileInfo
 			{
 				FileAttributes = info.dwFileAttributes,
@@ -663,14 +675,15 @@ public sealed class HcxFileSystem : FileSystemBase
 		{
 			fileAttributes = (uint)FileAttributes.Normal;
 		}
-		if (desc.Stream != null)
+		FileStream? stream = desc.Stream;
+		if (stream != null)
 		{
 			FILE_BASIC_INFO info = default;
 			if (fileAttributes != unchecked((uint)-1)) info.FileAttributes = fileAttributes;
 			if (creationTime != 0) info.CreationTime = creationTime;
 			if (lastAccessTime != 0) info.LastAccessTime = lastAccessTime;
 			if (lastWriteTime != 0) info.LastWriteTime = lastWriteTime;
-			if (!SetFileInformationByHandle(desc.Stream.SafeFileHandle.DangerousGetHandle(), 0, ref info, (uint)Marshal.SizeOf(info)))
+			if (!SetFileInformationByHandle(stream.SafeFileHandle, 0, ref info, (uint)Marshal.SizeOf(info)))
 			{
 				ThrowIoExceptionWithWin32(Marshal.GetLastWin32Error());
 			}
@@ -686,10 +699,11 @@ public sealed class HcxFileSystem : FileSystemBase
 
 	private static void SetDispositionInternal(FileDesc desc, bool safe)
 	{
-		if (desc.Stream != null)
+		FileStream? stream = desc.Stream;
+		if (stream != null)
 		{
 			FILE_DISPOSITION_INFO info = new FILE_DISPOSITION_INFO { DeleteFile = true };
-			if (!SetFileInformationByHandle(desc.Stream.SafeFileHandle.DangerousGetHandle(), 4, ref info, (uint)Marshal.SizeOf(info)) && !safe)
+			if (!SetFileInformationByHandle(stream.SafeFileHandle, 4, ref info, (uint)Marshal.SizeOf(info)) && !safe)
 			{
 				ThrowIoExceptionWithWin32(Marshal.GetLastWin32Error());
 			}
@@ -835,13 +849,13 @@ public sealed class HcxFileSystem : FileSystemBase
 	}
 
 	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern bool GetFileInformationByHandle(IntPtr hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+	private static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern bool SetFileInformationByHandle(IntPtr hFile, int fileInformationClass, ref FILE_BASIC_INFO lpFileInformation, uint dwBufferSize);
+	private static extern bool SetFileInformationByHandle(SafeFileHandle hFile, int fileInformationClass, ref FILE_BASIC_INFO lpFileInformation, uint dwBufferSize);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern bool SetFileInformationByHandle(IntPtr hFile, int fileInformationClass, ref FILE_DISPOSITION_INFO lpFileInformation, uint dwBufferSize);
+	private static extern bool SetFileInformationByHandle(SafeFileHandle hFile, int fileInformationClass, ref FILE_DISPOSITION_INFO lpFileInformation, uint dwBufferSize);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
 	private static extern bool MoveFileExW([MarshalAs(UnmanagedType.LPWStr)] string lpExistingFileName, [MarshalAs(UnmanagedType.LPWStr)] string lpNewFileName, uint dwFlags);
@@ -850,5 +864,5 @@ public sealed class HcxFileSystem : FileSystemBase
 	private static extern bool SetFileSecurityW([MarshalAs(UnmanagedType.LPWStr)] string fileName, int securityInformation, byte[] securityDescriptor);
 
 	[DllImport("advapi32.dll", SetLastError = true)]
-	private static extern bool SetKernelObjectSecurity(IntPtr handle, int securityInformation, byte[] securityDescriptor);
+	private static extern bool SetKernelObjectSecurity(SafeFileHandle handle, int securityInformation, byte[] securityDescriptor);
 }

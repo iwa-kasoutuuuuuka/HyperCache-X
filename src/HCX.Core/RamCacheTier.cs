@@ -141,7 +141,8 @@ public sealed class RamCacheTier : IL1CacheTier
 		bool isDirty,
 		long backingSize,
 		long backingTicks,
-		double aiScore)
+		double aiScore,
+		Action<BlockKey, byte[], int>? onEvictDirty = null)
 	{
 		if (!IsEnabled)
 		{
@@ -191,6 +192,10 @@ public sealed class RamCacheTier : IL1CacheTier
 						LastAccessUtc = new DateTime(Volatile.Read(ref victim.LastAccessUtcTicks), DateTimeKind.Utc),
 						AiScore = victim.AiScore
 					};
+					if (victim.IsDirty)
+					{
+						onEvictDirty?.Invoke(victim.Key, victim.Data, victim.ValidLength);
+					}
 					RemoveEntryLocked(victim);
 				}
 			}
@@ -698,13 +703,15 @@ public sealed class RamCacheTier : IL1CacheTier
 			map = new Dictionary<long, int>();
 			_dirtyBlocksByFile[key.RelativePath] = map;
 		}
+		bool hadPrev = map.TryGetValue(key.BlockIndex, out int prevValidLen);
+		long prevEnd = hadPrev ? key.BlockIndex * _blockSize + prevValidLen : -1L;
 		map[key.BlockIndex] = validLen;
 		long end = key.BlockIndex * _blockSize + validLen;
 		if (!_dirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) || end > curMax)
 		{
 			_dirtyMaxEndByFile[key.RelativePath] = end;
 		}
-		else
+		else if (hadPrev && prevEnd >= curMax && end < prevEnd)
 		{
 			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
 		}
@@ -716,13 +723,17 @@ public sealed class RamCacheTier : IL1CacheTier
 		{
 			return;
 		}
-		map.Remove(key.BlockIndex);
+		if (!map.Remove(key.BlockIndex, out int removedValidLen))
+		{
+			return;
+		}
 		if (map.Count == 0)
 		{
 			_dirtyBlocksByFile.Remove(key.RelativePath);
 			_dirtyMaxEndByFile.Remove(key.RelativePath);
 		}
-		else
+		else if (_dirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) &&
+		         key.BlockIndex * _blockSize + removedValidLen >= curMax)
 		{
 			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
 		}

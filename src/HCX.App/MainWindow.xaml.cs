@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -14,6 +15,7 @@ using System.Windows.Resources;
 using System.Windows.Threading;
 using HCX.Core;
 using HCX.VirtualFs;
+using Microsoft.Win32;
 
 namespace HCX.App;
 
@@ -32,6 +34,8 @@ public partial class MainWindow : Window
 		}
 	}
 
+	private const int MaxLogLines = 500;
+
 	private static readonly SolidColorBrush BrushCold = CreateFrozenBrush(15, 15, 25);
 	private static readonly SolidColorBrush BrushRamLow = CreateFrozenBrush(0, 120, 145);
 	private static readonly SolidColorBrush BrushRamHot = CreateFrozenBrush(0, 242, 254);
@@ -42,31 +46,72 @@ public partial class MainWindow : Window
 	private readonly List<EngineSession> _sessions = new List<EngineSession>();
 	private readonly List<RamDiskHost> _ramDiskHosts = new List<RamDiskHost>();
 	private readonly System.Windows.Shapes.Rectangle[] _heatmapRects = new System.Windows.Shapes.Rectangle[256];
+	private readonly Queue<string> _logLines = new Queue<string>();
+	private readonly bool _startMinimized;
 
 	private DispatcherTimer? _updateTimer;
 	private long _lastIoBytes;
 	private DateTime _lastUpdateUtc = DateTime.UtcNow;
 	private NotifyIcon? _notifyIcon;
+	private ContextMenuStrip? _trayMenu;
+	private ToolStripItem? _trayStatusSeparator;
+	private ToolStripItem? _trayStatusItem;
+	private ToolStripItem? _traySyncItem;
+	private ToolStripItem? _trayStopItem;
 	private bool _isExplicitExit;
+	private int _shutdownExecuted;
 	private string? _customTargetFolder;
+	private List<DiskInfo> _cachedDisks = new List<DiskInfo>();
+	private AppSettings _settings = new AppSettings();
 
-	public MainWindow()
+	public MainWindow() : this(startMinimized: false)
 	{
+	}
+
+	public MainWindow(bool startMinimized)
+	{
+		_startMinimized = startMinimized;
 		InitializeComponent();
 		ApplyAppIcon();
-		LoadDisksAndOptions();
 		InitializeHeatmap();
 		UpdateWinFspStatus();
 		InitializeTray();
 
 		StateChanged += OnStateChanged;
 		Closing += OnWindowClosing;
+		Loaded += OnWindowLoaded;
+		SystemEvents.SessionEnding += OnSystemSessionEnding;
 
-		Log("HyperCache X v2.0 準備完了 (既存RAMDisk優先 L1 + 永続L2 SSD + 内蔵RAMディスク)。");
-		DiskInfo? preferredRam = DiskUtility.FindPreferredRamDisk();
+		if (_startMinimized)
+		{
+			WindowState = WindowState.Minimized;
+			Hide();
+		}
+
+		Log("HyperCache X v2.1 起動中 (ディスク情報を非同期読み込みしています)...");
+	}
+
+	private async void OnWindowLoaded(object sender, RoutedEventArgs e)
+	{
+		_settings = AppSettingsManager.Load();
+		ChkAutoRestore.IsChecked = _settings.AutoRestoreSession;
+		ChkAutoStartWindows.IsChecked = AppSettingsManager.IsWindowsAutoStartEnabled();
+
+		await RefreshDisksAndOptionsAsync();
+
+		ApplySavedSettingsToUi(_settings);
+		Log("HyperCache X v2.1 準備完了 (既存RAMDisk優先 L1 + 永続L2 SSD + 内蔵RAMディスク)。");
+
+		DiskInfo? preferredRam = DiskUtility.FindPreferredRamDisk(_cachedDisks);
 		if (preferredRam != null)
 		{
 			Log($"既存 RAMDisk を検出しました: {preferredRam.DisplayName} (L1 キャッシュで優先使用します)");
+		}
+
+		if (_settings.AutoRestoreSession && !string.IsNullOrWhiteSpace(_settings.TargetPath) && Directory.Exists(_settings.TargetPath))
+		{
+			Log("前回セッションの設定を自動復元してエンジンを起動します...");
+			StartEngineFromUi();
 		}
 	}
 
@@ -101,34 +146,40 @@ public partial class MainWindow : Window
 		{
 			_notifyIcon.Icon = SystemIcons.Shield;
 		}
+
+		_trayMenu = new ContextMenuStrip();
+		_trayMenu.Items.Add("ダッシュボードを表示", null, (_, _) => ShowWindow());
+		_trayStatusSeparator = new ToolStripSeparator();
+		_trayMenu.Items.Add(_trayStatusSeparator);
+		_trayStatusItem = _trayMenu.Items.Add("待機中", null, null);
+		_trayStatusItem.Enabled = false;
+		_traySyncItem = _trayMenu.Items.Add("今すぐすべて HDD へ同期", null, (_, _) => BtnSyncNow_Click(this, new RoutedEventArgs()));
+		_trayStopItem = _trayMenu.Items.Add("加速をすべて停止", null, (_, _) => BtnStop_Click(this, new RoutedEventArgs()));
+		_trayMenu.Items.Add(new ToolStripSeparator());
+		_trayMenu.Items.Add("完全に終了", null, (_, _) => ExitApp());
+
+		_notifyIcon.ContextMenuStrip = _trayMenu;
 		_notifyIcon.Visible = true;
-		_notifyIcon.Text = "HyperCache X v2.0 - 準備完了";
+		_notifyIcon.Text = "HyperCache X v2.1 - 準備完了";
 		_notifyIcon.DoubleClick += (_, _) => ShowWindow();
 		RefreshTrayMenu();
 	}
 
 	private void RefreshTrayMenu()
 	{
-		if (_notifyIcon == null)
+		if (_trayStatusItem == null || _trayStatusSeparator == null || _traySyncItem == null || _trayStopItem == null)
 		{
 			return;
 		}
-		ContextMenuStrip menu = new ContextMenuStrip();
-		menu.Items.Add("ダッシュボードを表示", null, (_, _) => ShowWindow());
-		if (_sessions.Count > 0 || _ramDiskHosts.Count > 0)
-		{
-			menu.Items.Add(new ToolStripSeparator());
-			ToolStripItem infoItem = menu.Items.Add($"稼働: 加速{_sessions.Count} / RAMDisk{_ramDiskHosts.Count} - Hit: {HitRateText.Text}", null, null);
-			infoItem.Enabled = false;
-		}
-		if (_sessions.Count > 0)
-		{
-			menu.Items.Add("今すぐすべて HDD へ同期", null, (_, _) => BtnSyncNow_Click(this, new RoutedEventArgs()));
-			menu.Items.Add("加速をすべて停止", null, (_, _) => BtnStop_Click(this, new RoutedEventArgs()));
-		}
-		menu.Items.Add(new ToolStripSeparator());
-		menu.Items.Add("完全に終了", null, (_, _) => ExitApp());
-		_notifyIcon.ContextMenuStrip = menu;
+
+		bool hasAny = _sessions.Count > 0 || _ramDiskHosts.Count > 0;
+		bool hasSessions = _sessions.Count > 0;
+
+		_trayStatusSeparator.Visible = hasAny;
+		_trayStatusItem.Visible = hasAny;
+		_trayStatusItem.Text = $"稼働: 加速{_sessions.Count} / RAMDisk{_ramDiskHosts.Count} - Hit: {HitRateText.Text}";
+		_traySyncItem.Visible = hasSessions;
+		_trayStopItem.Visible = hasSessions;
 	}
 
 	private void OnWindowClosing(object? sender, CancelEventArgs e)
@@ -155,18 +206,69 @@ public partial class MainWindow : Window
 		Activate();
 	}
 
-	private void ExitApp()
+	private void OnSystemSessionEnding(object sender, SessionEndingEventArgs e)
 	{
+		PerformSafeShutdown();
+	}
+
+	public void PerformSafeShutdown()
+	{
+		if (Interlocked.Exchange(ref _shutdownExecuted, 1) != 0)
+		{
+			return;
+		}
 		_isExplicitExit = true;
+		if (Dispatcher.CheckAccess())
+		{
+			try { SaveCurrentSettings(); } catch { }
+		}
+		try
+		{
+			SystemEvents.SessionEnding -= OnSystemSessionEnding;
+		}
+		catch
+		{
+		}
+
 		StopAllSessions();
 		UnmountAllRamDisksInternal();
-		_notifyIcon?.Dispose();
+
+		try
+		{
+			if (_notifyIcon != null)
+			{
+				_notifyIcon.Visible = false;
+				_notifyIcon.Dispose();
+				_notifyIcon = null;
+			}
+			_trayMenu?.Dispose();
+			_trayMenu = null;
+		}
+		catch
+		{
+		}
+	}
+
+	public void EmergencySafeShutdown()
+	{
+		PerformSafeShutdown();
+	}
+
+	private void ExitApp()
+	{
+		PerformSafeShutdown();
 		System.Windows.Application.Current.Shutdown();
 	}
 
-	private void LoadDisksAndOptions()
+	private async Task RefreshDisksAndOptionsAsync()
 	{
-		List<DiskInfo> disks = DiskUtility.GetDisks();
+		List<DiskInfo> disks = await Task.Run(DiskUtility.GetDisks);
+		_cachedDisks = disks;
+		PopulateDiskCombos(disks);
+	}
+
+	private void PopulateDiskCombos(List<DiskInfo> disks)
+	{
 		DiskList.ItemsSource = disks;
 		SsdList.ItemsSource = disks;
 
@@ -226,6 +328,110 @@ public partial class MainWindow : Window
 		{
 			int mIdx = freeLetters.IndexOf("M:");
 			RamDiskMountCombo.SelectedIndex = mIdx >= 0 ? mIdx : (freeLetters.Count > 1 ? 1 : 0);
+		}
+	}
+
+	private void ApplySavedSettingsToUi(AppSettings settings)
+	{
+		if (!string.IsNullOrWhiteSpace(settings.TargetPath) && Directory.Exists(settings.TargetPath))
+		{
+			DiskInfo? matchingDisk = _cachedDisks.FirstOrDefault(d =>
+				string.Equals(d.RootPath.TrimEnd('\\'), settings.TargetPath.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase));
+			if (matchingDisk != null)
+			{
+				DiskList.SelectedItem = matchingDisk;
+				_customTargetFolder = null;
+			}
+			else
+			{
+				_customTargetFolder = settings.TargetPath;
+				TxtTargetPath.Text = $"カスタムフォルダ: {_customTargetFolder}";
+			}
+		}
+
+		SelectComboItemByTag(L1BackendCombo, settings.L1BackendMode);
+		SelectComboItemByTag(RamSizeCombo, settings.RamSizeMb.ToString());
+
+		if (!string.IsNullOrWhiteSpace(settings.PreferredRamDiskRoot) && L1RamDiskCombo.ItemsSource is IEnumerable<DiskInfo> ramItems)
+		{
+			DiskInfo? ramMatch = ramItems.FirstOrDefault(d =>
+				string.Equals(d.RootPath.TrimEnd('\\'), settings.PreferredRamDiskRoot.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase));
+			if (ramMatch != null)
+			{
+				L1RamDiskCombo.SelectedItem = ramMatch;
+			}
+		}
+
+		if (!string.IsNullOrWhiteSpace(settings.SsdRoot))
+		{
+			DiskInfo? ssdMatch = _cachedDisks.FirstOrDefault(d =>
+				string.Equals(d.RootPath.TrimEnd('\\'), settings.SsdRoot.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase));
+			if (ssdMatch != null)
+			{
+				SsdList.SelectedItem = ssdMatch;
+			}
+		}
+
+		SelectComboItemByTag(SsdSizeCombo, settings.SsdSizeMb.ToString());
+		SelectComboItemByTag(WritePolicyCombo, settings.WritePolicy);
+
+		if (settings.PerformanceModeIndex >= 0 && settings.PerformanceModeIndex < PerformanceMode.Items.Count)
+		{
+			PerformanceMode.SelectedIndex = settings.PerformanceModeIndex;
+		}
+
+		if (!string.IsNullOrWhiteSpace(settings.MountPoint) && MountPointCombo.ItemsSource is IEnumerable<string> mounts)
+		{
+			string? match = mounts.FirstOrDefault(m => string.Equals(m, settings.MountPoint, StringComparison.OrdinalIgnoreCase));
+			if (match != null)
+			{
+				MountPointCombo.SelectedItem = match;
+			}
+		}
+
+		SelectComboItemByTag(RamDiskCapacityCombo, settings.RamDiskCapacityMb.ToString());
+		if (!string.IsNullOrWhiteSpace(settings.RamDiskLabel))
+		{
+			TxtRamDiskLabel.Text = settings.RamDiskLabel;
+		}
+	}
+
+	private void SaveCurrentSettings()
+	{
+		AppSettings current = new AppSettings
+		{
+			TargetPath = _customTargetFolder ?? (DiskList.SelectedItem as DiskInfo)?.RootPath,
+			L1BackendMode = (L1BackendCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "AutoPreferRamDisk",
+			RamSizeMb = GetSelectedTagLong(RamSizeCombo, 1024),
+			PreferredRamDiskRoot = (L1RamDiskCombo.SelectedItem as DiskInfo)?.RootPath,
+			SsdRoot = (SsdList.SelectedItem as DiskInfo)?.RootPath,
+			SsdSizeMb = GetSelectedTagLong(SsdSizeCombo, 2048),
+			WritePolicy = (WritePolicyCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "WriteBack",
+			MountPoint = MountPointCombo.SelectedItem as string,
+			PerformanceModeIndex = PerformanceMode.SelectedIndex,
+			RamDiskMountPoint = RamDiskMountCombo.SelectedItem as string,
+			RamDiskCapacityMb = GetSelectedTagLong(RamDiskCapacityCombo, 2048),
+			RamDiskLabel = string.IsNullOrWhiteSpace(TxtRamDiskLabel.Text) ? "HCX_RAMDISK" : TxtRamDiskLabel.Text.Trim(),
+			AutoStartWithWindows = ChkAutoStartWindows.IsChecked == true,
+			AutoRestoreSession = ChkAutoRestore.IsChecked == true
+		};
+		_settings = current;
+		AppSettingsManager.Save(current);
+	}
+
+	private static void SelectComboItemByTag(System.Windows.Controls.ComboBox combo, string? tag)
+	{
+		if (string.IsNullOrWhiteSpace(tag))
+		{
+			return;
+		}
+		foreach (object itemObj in combo.Items)
+		{
+			if (itemObj is ComboBoxItem item && string.Equals(item.Tag?.ToString(), tag, StringComparison.OrdinalIgnoreCase))
+			{
+				combo.SelectedItem = item;
+				break;
+			}
 		}
 	}
 
@@ -329,6 +535,11 @@ public partial class MainWindow : Window
 	}
 
 	private void BtnStart_Click(object sender, RoutedEventArgs e)
+	{
+		StartEngineFromUi();
+	}
+
+	private void StartEngineFromUi()
 	{
 		try
 		{
@@ -474,10 +685,12 @@ public partial class MainWindow : Window
 
 			BtnStop.IsEnabled = true;
 			BtnSyncNow.IsEnabled = true;
+			BtnClearL2Cache.IsEnabled = false;
 			StatusDot.Fill = System.Windows.Media.Brushes.LimeGreen;
 			TxtStatusLabel.Text = "オンライン";
 			TxtStatusLabel.Foreground = System.Windows.Media.Brushes.LimeGreen;
 
+			SaveCurrentSettings();
 			EnsureTimerRunning();
 			UpdateStats();
 			RefreshMountPointOptions();
@@ -489,7 +702,59 @@ public partial class MainWindow : Window
 		}
 	}
 
-	private void BtnCreateRamDisk_Click(object sender, RoutedEventArgs e)
+	private void BtnClearL2Cache_Click(object sender, RoutedEventArgs e)
+	{
+		if (_sessions.Count > 0)
+		{
+			System.Windows.MessageBox.Show("キャッシュを消去する前に、稼働中のエンジンを停止してください。", "L2 キャッシュ消去", MessageBoxButton.OK, MessageBoxImage.Warning);
+			return;
+		}
+		if (SsdList.SelectedItem is not DiskInfo ssdDisk)
+		{
+			System.Windows.MessageBox.Show("消去対象の L2 SSD ドライブを選択してください。");
+			return;
+		}
+
+		string ssdHcxDir = Path.Combine(ssdDisk.RootPath, ".hcx");
+		MessageBoxResult confirm = System.Windows.MessageBox.Show(
+			$"{ssdHcxDir} 内の永続 L2 キャッシュファイル (`cache_*.bin` / `cache_metadata_*.dat`) を削除します。\n(元の HDD 上のファイルは影響を受けません)\n\n続行しますか？",
+			"L2 キャッシュ消去の確認",
+			MessageBoxButton.YesNo,
+			MessageBoxImage.Question);
+		if (confirm != MessageBoxResult.Yes)
+		{
+			return;
+		}
+
+		int deleted = SsdFileCacheTier.DeleteCacheFiles(ssdHcxDir);
+		Log($"[L2 キャッシュ消去] {ssdHcxDir} から {deleted} 件のキャッシュファイルを削除しました。");
+		System.Windows.MessageBox.Show($"L2 キャッシュファイル {deleted} 件を削除しました。", "完了", MessageBoxButton.OK, MessageBoxImage.Information);
+	}
+
+	private void ChkAutoRestore_Click(object sender, RoutedEventArgs e)
+	{
+		SaveCurrentSettings();
+		Log(ChkAutoRestore.IsChecked == true
+			? "設定の自動保存・起動時復元を有効にしました。"
+			: "起動時の自動セッション復元を無効にしました。");
+	}
+
+	private void ChkAutoStartWindows_Click(object sender, RoutedEventArgs e)
+	{
+		bool enable = ChkAutoStartWindows.IsChecked == true;
+		if (!AppSettingsManager.SetWindowsAutoStart(enable))
+		{
+			ChkAutoStartWindows.IsChecked = !enable;
+			System.Windows.MessageBox.Show("Windows スタートアップ登録の変更に失敗しました。", "設定エラー", MessageBoxButton.OK, MessageBoxImage.Warning);
+			return;
+		}
+		SaveCurrentSettings();
+		Log(enable
+			? "Windows 起動時のトレイ常駐 (--minimized) を登録しました。"
+			: "Windows 起動時の自動起動を解除しました。");
+	}
+
+	private async void BtnCreateRamDisk_Click(object sender, RoutedEventArgs e)
 	{
 		try
 		{
@@ -535,7 +800,7 @@ public partial class MainWindow : Window
 			Log($"内蔵 RAMディスクを作成・マウントしました: {mountPoint}\\ ({capMb} MB, Label={label})");
 
 			EnsureTimerRunning();
-			LoadDisksAndOptions();
+			await RefreshDisksAndOptionsAsync();
 			UpdateStats();
 			RefreshTrayMenu();
 		}
@@ -545,10 +810,10 @@ public partial class MainWindow : Window
 		}
 	}
 
-	private void BtnUnmountAllRamDisks_Click(object sender, RoutedEventArgs e)
+	private async void BtnUnmountAllRamDisks_Click(object sender, RoutedEventArgs e)
 	{
 		UnmountAllRamDisksInternal();
-		LoadDisksAndOptions();
+		await RefreshDisksAndOptionsAsync();
 		UpdateStats();
 		RefreshTrayMenu();
 	}
@@ -561,10 +826,13 @@ public partial class MainWindow : Window
 		}
 		foreach (RamDiskHost host in _ramDiskHosts)
 		{
-			host.Dispose();
+			try { host.Dispose(); } catch { }
 		}
 		_ramDiskHosts.Clear();
-		BtnUnmountAllRamDisks.IsEnabled = false;
+		if (Dispatcher.CheckAccess())
+		{
+			BtnUnmountAllRamDisks.IsEnabled = false;
+		}
 		Log("作成した内蔵 RAMディスクをすべて解除し、メモリを解放しました。");
 	}
 
@@ -601,6 +869,7 @@ public partial class MainWindow : Window
 			{
 				_heatmapRects[i].Fill = BrushCold;
 			}
+			RefreshTrayMenu();
 			return;
 		}
 
@@ -670,7 +939,7 @@ public partial class MainWindow : Window
 
 		if (_notifyIcon != null)
 		{
-			_notifyIcon.Text = $"HCX v2.0 - {_sessions.Count}件稼働 (Hit: {hitRate:F1}%)";
+			_notifyIcon.Text = $"HCX v2.1 - {_sessions.Count}件稼働 (Hit: {hitRate:F1}%)";
 		}
 		RefreshTrayMenu();
 	}
@@ -761,33 +1030,48 @@ public partial class MainWindow : Window
 	{
 		foreach (EngineSession session in _sessions)
 		{
-			session.Dispose();
+			try { session.Dispose(); } catch { }
 		}
 		_sessions.Clear();
-		if (_ramDiskHosts.Count == 0)
+		if (Dispatcher.CheckAccess())
 		{
-			_updateTimer?.Stop();
-			_updateTimer = null;
-		}
-		_lastIoBytes = 0;
+			if (_ramDiskHosts.Count == 0)
+			{
+				_updateTimer?.Stop();
+				_updateTimer = null;
+			}
+			_lastIoBytes = 0;
 
-		BtnStop.IsEnabled = false;
-		BtnSyncNow.IsEnabled = false;
-		StatusDot.Fill = System.Windows.Media.Brushes.Crimson;
-		TxtStatusLabel.Text = "停止中";
-		TxtStatusLabel.Foreground = System.Windows.Media.Brushes.Crimson;
+			BtnStop.IsEnabled = false;
+			BtnSyncNow.IsEnabled = false;
+			BtnClearL2Cache.IsEnabled = true;
+			StatusDot.Fill = System.Windows.Media.Brushes.Crimson;
+			TxtStatusLabel.Text = "停止中";
+			TxtStatusLabel.Foreground = System.Windows.Media.Brushes.Crimson;
+		}
 		if (_notifyIcon != null)
 		{
-			_notifyIcon.Text = "HyperCache X v2.0 - 準備完了";
+			_notifyIcon.Text = "HyperCache X v2.1 - 準備完了";
 		}
 		Log("すべての仮想ドライブを安全にアンマウントし、HDD 同期を完了しました。");
 	}
 
 	private void Log(string message)
 	{
-		Dispatcher.Invoke(() =>
+		if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
 		{
-			LogOutput.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}\n");
+			return;
+		}
+
+		string line = $"[{DateTime.Now:HH:mm:ss}] {message}";
+		Dispatcher.BeginInvoke(() =>
+		{
+			_logLines.Enqueue(line);
+			while (_logLines.Count > MaxLogLines)
+			{
+				_logLines.Dequeue();
+			}
+			LogOutput.Text = string.Join("\n", _logLines) + "\n";
 			LogScroller.ScrollToEnd();
 		});
 	}

@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        Title="HyperCache X v2.0 - 3-Tier Hybrid Storage &amp; RAMDisk Engine"
+        Title="HyperCache X v2.1 - 3-Tier Hybrid Storage &amp; RAMDisk Engine"
         Height="820"
         Width="1160"
         MinHeight="700"
@@ -111,7 +111,7 @@
           </TextBlock.Effect>
         </TextBlock>
         <Border Background="#4FACFE" Padding="8,3" CornerRadius="4" VerticalAlignment="Bottom" Margin="12,0,0,6">
-          <TextBlock Text="3-TIER HYBRID + RAMDISK v2.0" Foreground="#FF000000" FontSize="10" FontWeight="Bold" />
+          <TextBlock Text="3-TIER HYBRID + RAMDISK v2.1" Foreground="#FF000000" FontSize="10" FontWeight="Bold" />
         </Border>
       </StackPanel>
       <StackPanel HorizontalAlignment="Right" VerticalAlignment="Center" Orientation="Horizontal">
@@ -361,7 +361,19 @@
                       <Button x:Name="BtnBenchmark" Grid.Column="1" Content="実測ベンチマーク" Height="30" Margin="4,0,0,0" FontSize="11" Click="BtnBenchmark_Click" />
                     </Grid>
 
-                    <Button x:Name="BtnStop" Content="加速エンジン停止" Height="30" IsEnabled="False" Foreground="#CCC" Click="BtnStop_Click" />
+                    <Grid Margin="0,0,0,8">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                      </Grid.ColumnDefinitions>
+                      <Button x:Name="BtnStop" Grid.Column="0" Content="加速エンジン停止" Height="30" Margin="0,0,4,0" IsEnabled="False" Foreground="#CCC" Click="BtnStop_Click" />
+                      <Button x:Name="BtnClearL2Cache" Grid.Column="1" Content="L2 キャッシュ消去" Height="30" Margin="4,0,0,0" FontSize="11" Foreground="#CCC" Click="BtnClearL2Cache_Click" />
+                    </Grid>
+
+                    <StackPanel Orientation="Vertical" Margin="0,2,0,0">
+                      <CheckBox x:Name="ChkAutoRestore" Content="前回設定を記憶・起動時に自動復元" Foreground="#AAA" FontSize="10" Margin="0,0,0,4" Click="ChkAutoRestore_Click" />
+                      <CheckBox x:Name="ChkAutoStartWindows" Content="Windows 起動時にトレイ常駐 (--minimized)" Foreground="#AAA" FontSize="10" Click="ChkAutoStartWindows_Click" />
+                    </StackPanel>
                   </StackPanel>
                 </TabItem>
 
@@ -430,7 +442,7 @@
     <!-- Footer -->
     <Grid Grid.Row="3" Margin="0,12,0,0">
       <TextBlock Text="安全モード: ユーザーモード 3階層ハイブリッド (既存RAMDisk優先 L1 + 永続L2 SSD + WinFsp)" Foreground="#43E97B" FontSize="10" FontWeight="Bold" />
-      <TextBlock HorizontalAlignment="Right" Text="HyperCache X v2.0" Foreground="#555" FontSize="10" />
+      <TextBlock HorizontalAlignment="Right" Text="HyperCache X v2.1" Foreground="#555" FontSize="10" />
     </Grid>
   </Grid>
 </Window>

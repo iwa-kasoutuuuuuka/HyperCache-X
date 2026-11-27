@@ -8,6 +8,7 @@ obj/
 *.sln.docstates
 TestResults/
 publish/
+dist/
 
 # C/C++ / WDK driver build artifacts
 x64/

@@ -965,23 +965,51 @@ public sealed class HybridCacheEngine : IDisposable
 		List<string> files = new List<string>();
 		if (File.Exists(fullTarget))
 		{
+			if ((File.GetAttributes(fullTarget) & FileAttributes.ReparsePoint) != 0)
+			{
+				throw new UnauthorizedAccessException($"Refusing to warm reparse point: {norm}");
+			}
 			files.Add(fullTarget);
 		}
 		else if (Directory.Exists(fullTarget))
 		{
-			foreach (string f in Directory.EnumerateFiles(fullTarget, "*", SearchOption.AllDirectories))
+			if ((File.GetAttributes(fullTarget) & FileAttributes.ReparsePoint) != 0)
 			{
-				if (cancellationToken.IsCancellationRequested) break;
+				throw new UnauthorizedAccessException($"Refusing to warm reparse point directory: {norm}");
+			}
+			Queue<string> dirQueue = new Queue<string>();
+			dirQueue.Enqueue(fullTarget);
+			while (dirQueue.Count > 0 && !cancellationToken.IsCancellationRequested)
+			{
+				string currentDir = dirQueue.Dequeue();
 				try
 				{
-					if ((File.GetAttributes(f) & FileAttributes.ReparsePoint) != 0) continue;
-					string relCheck = Path.GetRelativePath(_targetRootFull, f);
-					if (relCheck.StartsWith(".hcx", StringComparison.OrdinalIgnoreCase)) continue;
-					files.Add(f);
+					foreach (string subDir in Directory.EnumerateDirectories(currentDir))
+					{
+						if (cancellationToken.IsCancellationRequested) break;
+						try
+						{
+							if ((File.GetAttributes(subDir) & FileAttributes.ReparsePoint) != 0) continue;
+							string relSub = Path.GetRelativePath(_targetRootFull, subDir);
+							if (relSub.StartsWith(".hcx", StringComparison.OrdinalIgnoreCase)) continue;
+							dirQueue.Enqueue(subDir);
+						}
+						catch { }
+					}
+					foreach (string f in Directory.EnumerateFiles(currentDir))
+					{
+						if (cancellationToken.IsCancellationRequested) break;
+						try
+						{
+							if ((File.GetAttributes(f) & FileAttributes.ReparsePoint) != 0) continue;
+							string relCheck = Path.GetRelativePath(_targetRootFull, f);
+							if (relCheck.StartsWith(".hcx", StringComparison.OrdinalIgnoreCase)) continue;
+							files.Add(f);
+						}
+						catch { }
+					}
 				}
-				catch
-				{
-				}
+				catch { }
 			}
 		}
 		else

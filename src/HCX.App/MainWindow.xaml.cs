@@ -477,7 +477,9 @@ public partial class MainWindow : Window
 			WritePolicy = (WritePolicyCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "WriteBack",
 			MountPoint = MountPointCombo.SelectedItem as string,
 			PerformanceModeIndex = PerformanceMode.SelectedIndex,
-			FlushIntervalSeconds = (int)GetSelectedTagLong(FlushIntervalCombo, 10)
+			FlushIntervalSeconds = (int)GetSelectedTagLong(FlushIntervalCombo, 10),
+			WorkloadPreset = GetSelectedWorkloadPreset(),
+			EnableBatterySafeMode = ChkBatterySafe.IsChecked == true
 		};
 	}
 
@@ -496,6 +498,8 @@ public partial class MainWindow : Window
 			MountPoint = uiProfile.MountPoint,
 			PerformanceModeIndex = uiProfile.PerformanceModeIndex,
 			FlushIntervalSeconds = uiProfile.FlushIntervalSeconds,
+			WorkloadPreset = uiProfile.WorkloadPreset,
+			EnableBatterySafeMode = uiProfile.EnableBatterySafeMode,
 			RamDiskMountPoint = RamDiskMountCombo.SelectedItem as string,
 			RamDiskCapacityMb = GetSelectedTagLong(RamDiskCapacityCombo, 2048),
 			RamDiskLabel = string.IsNullOrWhiteSpace(TxtRamDiskLabel.Text) ? "HCX_RAMDISK" : TxtRamDiskLabel.Text.Trim(),
@@ -504,11 +508,17 @@ public partial class MainWindow : Window
 			SavedSessions = _sessions.Select(s => s.Profile).ToList(),
 			SavedRamDisks = _ramDiskHosts
 				.Where(h => !string.IsNullOrWhiteSpace(h.MountedPoint))
-				.Select(h => new RamDiskProfile
+				.Select(h =>
 				{
-					MountPoint = h.MountedPoint,
-					CapacityMb = h.CapacityBytes / (1024L * 1024L),
-					VolumeLabel = h.VolumeLabel
+					_ramDiskPersistence.TryGetValue(h, out (string BackupDir, bool AutoPersist) persist);
+					return new RamDiskProfile
+					{
+						MountPoint = h.MountedPoint,
+						CapacityMb = h.CapacityBytes / (1024L * 1024L),
+						VolumeLabel = h.VolumeLabel,
+						BackupDirectory = persist.BackupDir,
+						AutoPersist = persist.AutoPersist
+					};
 				})
 				.ToList()
 		};

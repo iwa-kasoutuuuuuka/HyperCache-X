@@ -17,9 +17,14 @@ namespace HCX.Core;
 /// </summary>
 public sealed class HcxControlPipeServer : IDisposable
 {
+	private const int MaxConcurrentClients = 4;
+	private const int MaxRequestLineChars = 65536;
+	private const int ClientReadTimeoutMs = 5000;
+
 	private readonly string _pipeName;
 	private readonly Func<string, JsonElement, object> _handler;
 	private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+	private readonly SemaphoreSlim _clientSlots = new SemaphoreSlim(MaxConcurrentClients, MaxConcurrentClients);
 	private readonly Task _acceptTask;
 	private bool _disposed;
 
@@ -45,32 +50,57 @@ public sealed class HcxControlPipeServer : IDisposable
 			NamedPipeServerStream? pipe = null;
 			try
 			{
+				await _clientSlots.WaitAsync(token).ConfigureAwait(false);
 				pipe = CreateUserScopedServerPipe(_pipeName);
 				await pipe.WaitForConnectionAsync(token).ConfigureAwait(false);
-				await HandleClientAsync(pipe, token).ConfigureAwait(false);
+
+				NamedPipeServerStream connectedPipe = pipe;
+				pipe = null;
+				_ = Task.Run(async () =>
+				{
+					try
+					{
+						await HandleClientAsync(connectedPipe, token).ConfigureAwait(false);
+					}
+					catch { }
+					finally
+					{
+						try { connectedPipe.Dispose(); } catch { }
+						try { _clientSlots.Release(); } catch { }
+					}
+				}, CancellationToken.None);
 			}
 			catch (OperationCanceledException)
 			{
+				if (pipe != null)
+				{
+					try { pipe.Dispose(); } catch { }
+					try { _clientSlots.Release(); } catch { }
+				}
 				break;
 			}
 			catch
 			{
+				if (pipe != null)
+				{
+					try { pipe.Dispose(); } catch { }
+					try { _clientSlots.Release(); } catch { }
+				}
 				try { await Task.Delay(100, token).ConfigureAwait(false); } catch { break; }
-			}
-			finally
-			{
-				try { pipe?.Dispose(); } catch { }
 			}
 		}
 	}
 
 	private async Task HandleClientAsync(NamedPipeServerStream pipe, CancellationToken token)
 	{
+		using CancellationTokenSource readCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+		readCts.CancelAfter(ClientReadTimeoutMs);
+
 		Encoding utf8 = new UTF8Encoding(false);
 		using StreamReader reader = new StreamReader(pipe, utf8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
 		using StreamWriter writer = new StreamWriter(pipe, utf8, bufferSize: 4096, leaveOpen: true) { NewLine = "\n", AutoFlush = true };
 
-		string? line = await reader.ReadLineAsync(token).ConfigureAwait(false);
+		string? line = await ReadBoundedLineAsync(reader, MaxRequestLineChars, readCts.Token).ConfigureAwait(false);
 		if (string.IsNullOrWhiteSpace(line))
 		{
 			return;
@@ -91,6 +121,30 @@ public sealed class HcxControlPipeServer : IDisposable
 		}
 
 		await writer.WriteLineAsync(responseJson).ConfigureAwait(false);
+	}
+
+	private static async Task<string?> ReadBoundedLineAsync(StreamReader reader, int maxChars, CancellationToken token)
+	{
+		StringBuilder sb = new StringBuilder(256);
+		char[] buf = new char[1];
+		while (sb.Length < maxChars)
+		{
+			int n = await reader.ReadAsync(buf.AsMemory(0, 1), token).ConfigureAwait(false);
+			if (n <= 0)
+			{
+				return sb.Length > 0 ? sb.ToString() : null;
+			}
+			char c = buf[0];
+			if (c == '\n')
+			{
+				return sb.ToString();
+			}
+			if (c != '\r')
+			{
+				sb.Append(c);
+			}
+		}
+		throw new InvalidOperationException($"IPC request exceeded maximum allowed length ({maxChars} chars).");
 	}
 
 	private static NamedPipeServerStream CreateUserScopedServerPipe(string pipeName)
@@ -120,6 +174,7 @@ public sealed class HcxControlPipeServer : IDisposable
 		try { _cts.Cancel(); } catch { }
 		try { _acceptTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
 		_cts.Dispose();
+		_clientSlots.Dispose();
 	}
 }
 

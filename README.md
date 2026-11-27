@@ -30,8 +30,8 @@
 ## セキュリティ・堅牢性設計
 
 - **生ディスク／生ボリューム書き込み禁止**: `CacheOptions.Validate()`・`AppSettingsManager.Sanitize()`・`InMemoryVolumeStore`・`HCX.Mcp` の全入口で `\\?\` / `\\.\` の生デバイスパスを拒否。
-- **Named Pipe ユーザー分離 ACL**: `HcxControlPipeServer` は `WindowsIdentity.GetCurrent().User` のみに `FullControl` を付与し、他ユーザープロセスからの操作を遮断。
-- **パストラバーサル & リンク越境 & 再帰キャッシュ防止**: 字句境界検証、`..`・NUL バイト・`.hcx` / `.hcx_bench_*` の遮断、ジャンクション／シンボリックリンクの解決先ルート境界チェック、Reparse Point スキップを徹底。
+- **Named Pipe ユーザー分離 ACL & DoS 耐性**: `HcxControlPipeServer` は `WindowsIdentity.GetCurrent().User` のみに `FullControl` を付与し、最大 4 並列セマフォ・5 秒読み取りタイムアウト・64 KB 行サイズ上限で Slowloris / OOM を防止。
+- **パストラバーサル & リンク越境 & 再帰キャッシュ防止**: 字句境界検証、`..`・NUL バイト・`.hcx` / `.hcx_bench_*` の遮断、ジャンクション／シンボリックリンクの解決先ルート境界チェックに加え、`WarmPath`・`InMemoryVolumeStore.SaveToDirectory`・`HCX.Mcp` 全パスで Reparse Point スキップ／拒否を徹底。
 - **最小権限 & 依存パッケージ監査**: `asInvoker` マニフェスト。全 5 プロジェクトで NuGet 既知脆弱性 **0 件**。
 
 ---
@@ -88,7 +88,7 @@ claude mcp add hypercache-x -- "E:\HCX\src\HCX.Mcp\bin\Release\net10.0-windows\H
 - [`src/HCX.VirtualFs`](src/HCX.VirtualFs/HCX.VirtualFs.csproj): WinFsp 仮想 FS・永続化対応内蔵 RAM ディスク (`HcxFileSystem`, `InMemoryVolumeStore`, `MemoryFileSystem`, `RamDiskHost`, `WinFspRuntime`)
 - [`src/HCX.App`](src/HCX.App/HCX.App.csproj): ダークモード WPF ダッシュボード（32×8 ヒートマップ、60 秒スパークライン、ホットファイル Top 10、事前ウォームアップ、永続 RAMDisk、バッテリー保護、ライブ MCP IPC）
 - [`src/HCX.Mcp`](src/HCX.Mcp/HCX.Mcp.csproj): 外部依存ゼロの MCP stdio サーバー（12 ツール）
-- [`tests/HCX.Tests`](tests/HCX.Tests/HCX.Tests.csproj): xUnit 自動テストスイート（**65 件**）
+- [`tests/HCX.Tests`](tests/HCX.Tests/HCX.Tests.csproj): xUnit 自動テストスイート（**68 件** — セキュリティ回帰・Named Pipe IPC・Pre-Warm・永続 RAMDisk・シャード並列・MCP 12 ツール検証を含む）
 
 ### ビルド・テスト・配布コマンド
 

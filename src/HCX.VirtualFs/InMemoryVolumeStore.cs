@@ -958,6 +958,11 @@ public sealed class InMemoryVolumeStore
 				continue;
 			}
 			string targetPath = Path.Combine(currentHostDir, child.Name);
+			if ((File.Exists(targetPath) || Directory.Exists(targetPath)) &&
+			    (File.GetAttributes(targetPath) & FileAttributes.ReparsePoint) != 0)
+			{
+				continue;
+			}
 			if (child.IsDirectory)
 			{
 				Directory.CreateDirectory(targetPath);
@@ -1064,7 +1069,13 @@ public sealed class InMemoryVolumeStore
 		{
 			throw new ArgumentException("Raw device paths are disallowed for RAM disk backup.", nameof(backupDirectory));
 		}
-		if (mustExist && !Directory.Exists(Path.GetFullPath(backupDirectory)))
+		string full = Path.GetFullPath(backupDirectory);
+		if ((Directory.Exists(full) || File.Exists(full)) &&
+		    (File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0)
+		{
+			throw new UnauthorizedAccessException($"Refusing to use reparse point as RAM disk backup directory: {full}");
+		}
+		if (mustExist && !Directory.Exists(full))
 		{
 			throw new DirectoryNotFoundException($"Backup directory not found: {backupDirectory}");
 		}

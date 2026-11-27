@@ -150,7 +150,9 @@ public static class AppSettingsManager
 					WritePolicy = SanitizeWritePolicy(sp.WritePolicy),
 					MountPoint = SanitizeMountPoint(sp.MountPoint),
 					PerformanceModeIndex = Math.Clamp(sp.PerformanceModeIndex, 0, 2),
-					FlushIntervalSeconds = Math.Clamp(sp.FlushIntervalSeconds, 1, 300)
+					FlushIntervalSeconds = Math.Clamp(sp.FlushIntervalSeconds, 1, 300),
+					WorkloadPreset = Enum.IsDefined(sp.WorkloadPreset) ? sp.WorkloadPreset : WorkloadPreset.Balanced,
+					EnableBatterySafeMode = sp.EnableBatterySafeMode
 				});
 				if (cleanSessions.Count >= MaxProfiles)
 				{
@@ -200,6 +202,8 @@ public static class AppSettingsManager
 			MountPoint = SanitizeMountPoint(raw.MountPoint),
 			PerformanceModeIndex = Math.Clamp(raw.PerformanceModeIndex, 0, 2),
 			FlushIntervalSeconds = Math.Clamp(raw.FlushIntervalSeconds, 1, 300),
+			WorkloadPreset = Enum.IsDefined(raw.WorkloadPreset) ? raw.WorkloadPreset : WorkloadPreset.Balanced,
+			EnableBatterySafeMode = raw.EnableBatterySafeMode,
 			RamDiskMountPoint = SanitizeMountPoint(raw.RamDiskMountPoint),
 			RamDiskCapacityMb = Math.Clamp(raw.RamDiskCapacityMb, 0L, MaxCacheSizeMb),
 			RamDiskLabel = SanitizeLabel(raw.RamDiskLabel),

@@ -236,4 +236,88 @@ public sealed class FeatureExpansionTests : IDisposable
 		Assert.True(okSync, syncErr);
 		Assert.Equal(7, syncData?["totalFlushedBlocks"]?.GetValue<int>());
 	}
+
+	[Fact]
+	public void WarmPath_SkipsDirectoryJunctionEscapingTargetRoot()
+	{
+		const int blockSize = 4096;
+		string outsideDir = Path.Combine(_tempRoot, "outside_secret");
+		Directory.CreateDirectory(outsideDir);
+		File.WriteAllBytes(Path.Combine(outsideDir, "secret.dat"), Enumerable.Repeat((byte)0xEE, blockSize).ToArray());
+
+		string safeDir = Path.Combine(_targetDir, "safe");
+		Directory.CreateDirectory(safeDir);
+		File.WriteAllBytes(Path.Combine(safeDir, "ok.dat"), Enumerable.Repeat((byte)0x11, blockSize).ToArray());
+
+		string junctionPath = Path.Combine(_targetDir, "escape_link");
+		using (System.Diagnostics.Process proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+		{
+			FileName = "cmd.exe",
+			Arguments = $"/c mklink /J \"{junctionPath}\" \"{outsideDir}\"",
+			UseShellExecute = false,
+			CreateNoWindow = true
+		})!)
+		{
+			proc.WaitForExit(5000);
+		}
+		Assert.True((File.GetAttributes(junctionPath) & FileAttributes.ReparsePoint) != 0);
+
+		using HybridCacheEngine engine = new HybridCacheEngine(new CacheOptions
+		{
+			TargetRootPath = _targetDir,
+			SsdCacheDirectory = _ssdDir,
+			BlockSizeBytes = blockSize,
+			RamCacheSizeBytes = 16 * blockSize,
+			SsdCacheSizeBytes = 16 * blockSize,
+			EnableReadAhead = false
+		});
+		engine.Start();
+
+		WarmResult res = engine.WarmPath("", maxBytes: 1024 * 1024, pin: false);
+		Assert.Equal(1, res.FilesWarmed);
+		Assert.Equal(1, res.BlocksWarmed);
+	}
+
+	[Fact]
+	public void InMemoryVolumeStore_SaveToDirectory_RejectsReparsePointBackupDirectory()
+	{
+		string realTarget = Path.Combine(_tempRoot, "real_backup");
+		Directory.CreateDirectory(realTarget);
+		string junctionBackup = Path.Combine(_tempRoot, "junction_backup");
+		using (System.Diagnostics.Process proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+		{
+			FileName = "cmd.exe",
+			Arguments = $"/c mklink /J \"{junctionBackup}\" \"{realTarget}\"",
+			UseShellExecute = false,
+			CreateNoWindow = true
+		})!)
+		{
+			proc.WaitForExit(5000);
+		}
+
+		InMemoryVolumeStore store = new InMemoryVolumeStore(2 * 1024 * 1024);
+		store.CreateEntry(@"\a.bin", false, (uint)FileAttributes.Archive, null, 0);
+		store.WriteFile(@"\a.bin", 0, new byte[] { 1, 2, 3 }, false, false, out _);
+
+		Assert.Throws<UnauthorizedAccessException>(() => store.SaveToDirectory(junctionBackup));
+	}
+
+	[Fact]
+	public void HcxControlPipeIpc_RejectsOversizedLine_AndRemainsResponsive()
+	{
+		string pipeName = $"HyperCacheX_SecPipe_{Guid.NewGuid():N}";
+		using HcxControlPipeServer server = new HcxControlPipeServer((action, _) => new { action, ok = true }, pipeName);
+
+		// Send > 64KB line without newline: server must reject safely and remain healthy.
+		using (System.IO.Pipes.NamedPipeClientStream badClient = new System.IO.Pipes.NamedPipeClientStream(".", pipeName, System.IO.Pipes.PipeDirection.InOut))
+		{
+			badClient.Connect(2000);
+			byte[] huge = Enumerable.Repeat((byte)'A', 70_000).ToArray();
+			try { badClient.Write(huge, 0, huge.Length); badClient.Flush(); } catch { }
+		}
+
+		bool okPing = HcxControlPipeClient.TrySend("ping", null, out JsonNode? pingData, out string? pingErr, pipeName);
+		Assert.True(okPing, pingErr);
+		Assert.True(pingData?["ok"]?.GetValue<bool>());
+	}
 }

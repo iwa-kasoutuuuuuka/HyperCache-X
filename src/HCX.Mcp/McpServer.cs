@@ -623,6 +623,10 @@ public sealed class HcxMcpServer : IDisposable
 	private object ToolWarmPath(JsonElement args)
 	{
 		string relPath = GetRequiredString(args, "relative_path");
+		if (relPath.IndexOf('\0') >= 0 || relPath.Contains("..", StringComparison.Ordinal))
+		{
+			throw new ArgumentException("relative_path must not contain NUL or '..' traversal segments.");
+		}
 		string? sessionId = GetOptionalString(args, "session_id");
 		int maxMb = Math.Clamp(GetOptionalInt(args, "max_mb", 128), 1, 1024);
 		bool pin = GetOptionalBool(args, "pin", false);
@@ -749,6 +753,10 @@ public sealed class HcxMcpServer : IDisposable
 		if (mustExist && !Directory.Exists(full))
 		{
 			throw new DirectoryNotFoundException($"Directory not found for {paramName}: {full}");
+		}
+		if (Directory.Exists(full) && (File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0)
+		{
+			throw new UnauthorizedAccessException($"{paramName} must not be a symbolic link or directory junction: {full}");
 		}
 		return full;
 	}

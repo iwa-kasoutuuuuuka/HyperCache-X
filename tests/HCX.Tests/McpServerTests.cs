@@ -64,18 +64,22 @@ public sealed class McpServerTests : IDisposable
 			Assert.True(doc.RootElement.TryGetProperty("result", out _));
 		}
 
-		// 4. tools/list returns all 8 HCX tools
+		// 4. tools/list returns all 12 HCX tools
 		string? listRaw = server.ProcessMessage("""{"jsonrpc":"2.0","id":2,"method":"tools/list"}""");
 		Assert.NotNull(listRaw);
 		using (JsonDocument doc = JsonDocument.Parse(listRaw!))
 		{
 			JsonElement tools = doc.RootElement.GetProperty("result").GetProperty("tools");
-			Assert.Equal(8, tools.GetArrayLength());
+			Assert.Equal(12, tools.GetArrayLength());
 			string[] names = tools.EnumerateArray().Select(t => t.GetProperty("name").GetString()!).ToArray();
 			Assert.Contains("hcx_get_system_info", names);
 			Assert.Contains("hcx_run_benchmark", names);
 			Assert.Contains("hcx_start_session", names);
 			Assert.Contains("hcx_cleanup_cache", names);
+			Assert.Contains("hcx_warm_path", names);
+			Assert.Contains("hcx_get_hot_files", names);
+			Assert.Contains("hcx_live_app_status", names);
+			Assert.Contains("hcx_live_app_sync", names);
 		}
 
 		// 5. Parse error (-32700) and unknown method (-32601)

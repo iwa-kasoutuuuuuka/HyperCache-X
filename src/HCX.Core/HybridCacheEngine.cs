@@ -38,15 +38,24 @@ public sealed class HybridCacheEngine : IDisposable
 		public RamBlockCopy? CleanSource { get; init; }
 	}
 
+	private sealed class FileStatCounter
+	{
+		public long Hits;
+		public long Misses;
+		public long Bytes;
+	}
+
 	private const int MaxCoalescedFlushBlocks = 16; // 1 MB per coalesced write
 	private const int FileLockStripeCount = 512;
 	private const int MaxStatCacheEntries = 8192;
+	private const int MaxHotFileEntries = 4096;
 
 	private readonly CacheOptions _options;
 	private readonly string _targetRootFull;
 	private readonly string _instanceId;
 	private readonly int _blockSize;
 	private readonly AiAccessScorer _scorer;
+	private readonly CacheFilterRules _filterRules;
 	private readonly IL1CacheTier _ram;
 	private readonly SsdFileCacheTier _ssd;
 	private readonly MetadataManager _metadata;
@@ -54,7 +63,10 @@ public sealed class HybridCacheEngine : IDisposable
 	private readonly ConcurrentDictionary<string, CachedBackingStat> _statCache = new ConcurrentDictionary<string, CachedBackingStat>(StringComparer.OrdinalIgnoreCase);
 	private readonly ConcurrentDictionary<BlockKey, InFlightEvictionEntry> _inFlightEvictions = new ConcurrentDictionary<BlockKey, InFlightEvictionEntry>();
 	private readonly ConcurrentDictionary<BlockKey, RamBlockCopy> _inFlightCleanDemotions = new ConcurrentDictionary<BlockKey, RamBlockCopy>();
+	private readonly ConcurrentDictionary<string, FileStatCounter> _hotFileStats = new ConcurrentDictionary<string, FileStatCounter>(StringComparer.OrdinalIgnoreCase);
 	private readonly long _statTtlStopwatchTicks;
+	private volatile WritePolicy _effectiveWritePolicy;
+	private long _lastIoTimestamp;
 
 	private CancellationTokenSource? _cts;
 	private Task? _flushTask;
@@ -78,6 +90,8 @@ public sealed class HybridCacheEngine : IDisposable
 	public string MetadataFilePath => _metadata.MetadataPath;
 	public bool IsRunning => _isRunning;
 	public long PrefetchedBlocks => Interlocked.Read(ref _prefetchedBlocks);
+	public CacheFilterRules FilterRules => _filterRules;
+	public WritePolicy EffectiveWritePolicy => _effectiveWritePolicy;
 
 	public event Action<string>? OnLog;
 
@@ -94,6 +108,9 @@ public sealed class HybridCacheEngine : IDisposable
 		_targetRootFull = Path.GetFullPath(_options.TargetRootPath);
 		_instanceId = _options.ResolveInstanceId();
 		_blockSize = _options.BlockSizeBytes;
+		_filterRules = new CacheFilterRules(_options.WorkloadPreset);
+		_effectiveWritePolicy = _options.WritePolicy;
+		_lastIoTimestamp = Stopwatch.GetTimestamp();
 
 		string ssdDir = string.IsNullOrWhiteSpace(_options.SsdCacheDirectory)
 			? string.Empty
@@ -192,6 +209,10 @@ public sealed class HybridCacheEngine : IDisposable
 		string fullPath = ResolveBackingPath(rel);
 		ReaderWriterLockSlim fileLock = GetFileLock(rel);
 		List<(BlockKey Key, InFlightEvictionEntry Entry)>? deferredFlushes = null;
+		CacheFilterAction filterAction = _filterRules.Evaluate(rel);
+		Volatile.Write(ref _lastIoTimestamp, Stopwatch.GetTimestamp());
+		long localHits = 0;
+		long localMisses = 0;
 
 		fileLock.EnterReadLock();
 		byte[]? rentedBlockBuf = null;
@@ -224,6 +245,7 @@ public sealed class HybridCacheEngine : IDisposable
 						destSlice.Slice(ramCopied).Clear();
 					}
 					Interlocked.Increment(ref _ramHits);
+					localHits++;
 					_scorer.RecordL1HitLightweight(key, nowUtc, ramDirty);
 					bytesReadTotal += chunk;
 					continue;
@@ -249,6 +271,7 @@ public sealed class HybridCacheEngine : IDisposable
 						destSlice.Slice(copyCount).Clear();
 					}
 					Interlocked.Increment(ref _ssdHits);
+					localHits++;
 					_scorer.RecordAccess(key, isWrite: false, nowUtc, CacheTier.SsdL2, updateDirty: false);
 					bytesReadTotal += chunk;
 					continue;
@@ -267,6 +290,7 @@ public sealed class HybridCacheEngine : IDisposable
 						destSlice.Slice(copyCount).Clear();
 					}
 					Interlocked.Increment(ref _ramHits);
+					localHits++;
 					_scorer.RecordAccess(key, isWrite: false, nowUtc, CacheTier.SsdL2, updateDirty: true);
 					bytesReadTotal += chunk;
 					continue;
@@ -280,6 +304,7 @@ public sealed class HybridCacheEngine : IDisposable
 				{
 					rentedBlockBuf.AsSpan(blockOffset, chunk).CopyTo(destSlice);
 					Interlocked.Increment(ref _ssdHits);
+					localHits++;
 
 					// Keep dirty ownership single-place: only promote clean L2 blocks into L1 RAM.
 					if (!ssdMeta.IsDirty && _ram.IsEnabled && decision.ShouldPromoteToRam)
@@ -313,14 +338,16 @@ public sealed class HybridCacheEngine : IDisposable
 						destSlice.Slice(copyCount).Clear();
 					}
 					Interlocked.Increment(ref _ramHits);
+					localHits++;
 					_scorer.RecordAccess(key, isWrite: false, nowUtc, CacheTier.SsdL2, updateDirty: true);
 					bytesReadTotal += chunk;
 					continue;
 				}
 
 				// Tier 3: Backing HDD read
+				bool bypassCache = decision.IsSequentialBypass || filterAction == CacheFilterAction.Bypass;
 				int remaining = toRead - bytesReadTotal;
-				if (decision.IsSequentialBypass &&
+				if (bypassCache &&
 				    remaining > chunk &&
 				    exists &&
 				    pos < backingSize &&
@@ -336,6 +363,7 @@ public sealed class HybridCacheEngine : IDisposable
 					}
 					int blocksCovered = Math.Max(1, (remaining + _blockSize - 1) / _blockSize);
 					Interlocked.Add(ref _hddMisses, blocksCovered);
+					localMisses += blocksCovered;
 					bytesReadTotal += remaining;
 					break;
 				}
@@ -348,16 +376,19 @@ public sealed class HybridCacheEngine : IDisposable
 				}
 				rentedBlockBuf.AsSpan(blockOffset, chunk).CopyTo(destSlice);
 				Interlocked.Increment(ref _hddMisses);
+				localMisses++;
 
-				if (!decision.IsSequentialBypass && validLen > 0)
+				if (!bypassCache && validLen > 0)
 				{
-					if (_ram.IsEnabled && decision.ShouldPromoteToRam)
+					bool forceL1 = filterAction == CacheFilterAction.PriorityL1 || filterAction == CacheFilterAction.Pinned;
+					double score = filterAction == CacheFilterAction.Pinned ? 100.0 : decision.Score;
+					if (_ram.IsEnabled && (forceL1 || decision.ShouldPromoteToRam))
 					{
-						PutInRamWithDemotion(key, rentedBlockBuf, validLen, isDirty: false, backingSize, backingTicks, decision.Score, ref deferredFlushes);
+						PutInRamWithDemotion(key, rentedBlockBuf, validLen, isDirty: false, backingSize, backingTicks, score, ref deferredFlushes);
 					}
 					else if (_ssd.IsEnabled && decision.ShouldPromoteToSsd)
 					{
-						PutInSsdWithDeferredFlush(key, rentedBlockBuf, validLen, isDirty: false, backingSize, backingTicks, decision.Score, ref deferredFlushes);
+						PutInSsdWithDeferredFlush(key, rentedBlockBuf, validLen, isDirty: false, backingSize, backingTicks, score, ref deferredFlushes);
 					}
 
 					if (_options.EnableReadAhead && decision.SequentialStreak >= 2)
@@ -370,6 +401,7 @@ public sealed class HybridCacheEngine : IDisposable
 			}
 
 			Interlocked.Add(ref _totalReadBytes, bytesReadTotal);
+			RecordHotFileStat(rel, localHits, localMisses, bytesReadTotal);
 			return bytesReadTotal;
 		}
 		finally
@@ -404,9 +436,10 @@ public sealed class HybridCacheEngine : IDisposable
 		try
 		{
 			Interlocked.Add(ref _totalWriteBytes, source.Length);
+			Volatile.Write(ref _lastIoTimestamp, Stopwatch.GetTimestamp());
 			DateTime nowUtc = DateTime.UtcNow;
 
-			bool useWriteBack = _options.WritePolicy == WritePolicy.WriteBack && (_ram.IsEnabled || _ssd.IsEnabled);
+			bool useWriteBack = _effectiveWritePolicy == WritePolicy.WriteBack && (_ram.IsEnabled || _ssd.IsEnabled);
 			if (!useWriteBack)
 			{
 				if (!_inFlightEvictions.IsEmpty)
@@ -888,8 +921,183 @@ public sealed class HybridCacheEngine : IDisposable
 			SsdCacheFilePath = _ssd.CacheFilePath,
 			MountPoint = _options.MountPoint,
 			L1BackendSummary = _ram.BackendDescription,
-			WritePolicy = _options.WritePolicy
+			WritePolicy = _effectiveWritePolicy,
+			WorkloadPreset = _filterRules.Preset,
+			TopHotFiles = GetTopHotFiles(10)
 		};
+	}
+
+	/// <summary>
+	/// Dynamically switches WritePolicy (e.g., to WriteThrough on low battery). Flushes all dirty blocks immediately when switching to WriteThrough.
+	/// </summary>
+	public int SetWritePolicy(WritePolicy newPolicy)
+	{
+		WritePolicy prev = _effectiveWritePolicy;
+		_effectiveWritePolicy = newPolicy;
+		if (newPolicy == WritePolicy.WriteThrough && prev != WritePolicy.WriteThrough)
+		{
+			int flushed = SyncAll();
+			Log($"[セーフモード] WriteThrough へ切替・{flushed} ブロックを即時同期しました。");
+			return flushed;
+		}
+		return 0;
+	}
+
+	public void ApplyWorkloadPreset(WorkloadPreset preset)
+	{
+		_filterRules.ApplyPreset(preset);
+		Log($"[プリセット] ワークロード設定を {preset} に変更しました。");
+	}
+
+	/// <summary>
+	/// Pre-warms a file or directory subtree under TargetRootPath into L1/L2 cache, optionally pinning it in FilterRules.
+	/// </summary>
+	public WarmResult WarmPath(string relativePathOrPrefix, long maxBytes = 256L * 1024 * 1024, bool pin = false, CancellationToken cancellationToken = default)
+	{
+		string norm = BlockKey.NormalizeRelativePath(relativePathOrPrefix).TrimEnd('\\');
+		string fullTarget = ResolveBackingPath(norm);
+
+		if (pin && !string.IsNullOrEmpty(norm))
+		{
+			_filterRules.PinPath(norm);
+		}
+
+		List<string> files = new List<string>();
+		if (File.Exists(fullTarget))
+		{
+			files.Add(fullTarget);
+		}
+		else if (Directory.Exists(fullTarget))
+		{
+			foreach (string f in Directory.EnumerateFiles(fullTarget, "*", SearchOption.AllDirectories))
+			{
+				if (cancellationToken.IsCancellationRequested) break;
+				try
+				{
+					if ((File.GetAttributes(f) & FileAttributes.ReparsePoint) != 0) continue;
+					string relCheck = Path.GetRelativePath(_targetRootFull, f);
+					if (relCheck.StartsWith(".hcx", StringComparison.OrdinalIgnoreCase)) continue;
+					files.Add(f);
+				}
+				catch
+				{
+				}
+			}
+		}
+		else
+		{
+			throw new FileNotFoundException($"Warm target not found under root: {norm}");
+		}
+
+		long cap = Math.Max(_blockSize, maxBytes);
+		byte[] buf = ArrayPool<byte>.Shared.Rent(_blockSize);
+		int filesWarmed = 0;
+		int blocksWarmed = 0;
+		long bytesWarmed = 0;
+
+		try
+		{
+			foreach (string fullFile in files)
+			{
+				if (cancellationToken.IsCancellationRequested || bytesWarmed >= cap) break;
+
+				string rel = BlockKey.NormalizeRelativePath(Path.GetRelativePath(_targetRootFull, fullFile));
+				if (_filterRules.Evaluate(rel) == CacheFilterAction.Bypass) continue;
+
+				ReaderWriterLockSlim fileLock = GetFileLock(rel);
+				List<(BlockKey Key, InFlightEvictionEntry Entry)>? deferredFlushes = null;
+				fileLock.EnterReadLock();
+				try
+				{
+					(bool exists, long backingSize, long backingTicks) = RefreshBackingInfoLocked(rel, fullFile, null);
+					if (!exists || backingSize <= 0) continue;
+
+					using SafeFileHandle fh = File.OpenHandle(fullFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+					long fileBlockCount = (backingSize + _blockSize - 1) / _blockSize;
+					bool anyInFile = false;
+					double score = pin ? 100.0 : Math.Max(_options.RamPromoteScore, 4.0);
+
+					for (long bi = 0; bi < fileBlockCount && bytesWarmed < cap && !cancellationToken.IsCancellationRequested; bi++)
+					{
+						BlockKey key = new BlockKey(rel, bi);
+						Array.Clear(buf, 0, _blockSize);
+						int validLen = ReadExactHandle(fh, bi * _blockSize, buf.AsSpan(0, _blockSize));
+						if (validLen <= 0) break;
+
+						if (_ram.IsEnabled)
+						{
+							PutInRamWithDemotion(key, buf, validLen, isDirty: false, backingSize, backingTicks, score, ref deferredFlushes);
+						}
+						else if (_ssd.IsEnabled)
+						{
+							PutInSsdWithDeferredFlush(key, buf, validLen, isDirty: false, backingSize, backingTicks, score, ref deferredFlushes);
+						}
+						_scorer.UpdateTierState(key, _ram.IsEnabled ? CacheTier.RamL1 : CacheTier.SsdL2, isDirty: false, score);
+						blocksWarmed++;
+						bytesWarmed += validLen;
+						anyInFile = true;
+					}
+					if (anyInFile) filesWarmed++;
+				}
+				catch
+				{
+				}
+				finally
+				{
+					fileLock.ExitReadLock();
+					DrainDeferredEvictions(deferredFlushes);
+				}
+			}
+		}
+		finally
+		{
+			ArrayPool<byte>.Shared.Return(buf);
+		}
+
+		Log($"[Pre-Warm] {filesWarmed} ファイル / {blocksWarmed} ブロック ({bytesWarmed / (1024.0 * 1024.0):F2} MB) を事前キャッシュしました (Pin={pin})。");
+		return new WarmResult
+		{
+			FilesWarmed = filesWarmed,
+			BlocksWarmed = blocksWarmed,
+			BytesWarmed = bytesWarmed,
+			Pinned = pin
+		};
+	}
+
+	public HotFileStat[] GetTopHotFiles(int maxCount = 10)
+	{
+		if (_hotFileStats.IsEmpty || maxCount <= 0)
+		{
+			return Array.Empty<HotFileStat>();
+		}
+		return _hotFileStats
+			.Select(kv => new HotFileStat
+			{
+				RelativePath = kv.Key,
+				Hits = Interlocked.Read(ref kv.Value.Hits),
+				Misses = Interlocked.Read(ref kv.Value.Misses),
+				TotalBytes = Interlocked.Read(ref kv.Value.Bytes)
+			})
+			.OrderByDescending(s => s.Hits + s.Misses)
+			.ThenByDescending(s => s.TotalBytes)
+			.Take(maxCount)
+			.ToArray();
+	}
+
+	private void RecordHotFileStat(string rel, long hits, long misses, long bytes)
+	{
+		if (hits == 0 && misses == 0) return;
+		if (!_hotFileStats.TryGetValue(rel, out FileStatCounter? counter))
+		{
+			if (_hotFileStats.Count >= MaxHotFileEntries)
+			{
+				return;
+			}
+			counter = _hotFileStats.GetOrAdd(rel, static _ => new FileStatCounter());
+		}
+		if (hits > 0) Interlocked.Add(ref counter.Hits, hits);
+		if (misses > 0) Interlocked.Add(ref counter.Misses, misses);
+		if (bytes > 0) Interlocked.Add(ref counter.Bytes, bytes);
 	}
 
 	public void PersistMetadata(bool cleanShutdown = false)
@@ -1739,15 +1947,31 @@ public sealed class HybridCacheEngine : IDisposable
 
 	private async Task FlushLoopAsync(CancellationToken token)
 	{
+		long lastFullFlushTs = Stopwatch.GetTimestamp();
+		long intervalTicks = Math.Max(Stopwatch.Frequency, (long)(_options.FlushInterval.TotalSeconds * Stopwatch.Frequency));
+		long idleTicks = Math.Max(Stopwatch.Frequency / 2, (long)(_options.IdleFlushDelay.TotalSeconds * Stopwatch.Frequency));
+
 		while (!token.IsCancellationRequested)
 		{
 			try
 			{
-				await Task.Delay(_options.FlushInterval, token);
-				int flushed = SyncAll();
-				if (flushed > 0)
+				await Task.Delay(TimeSpan.FromSeconds(1), token);
+				long nowTs = Stopwatch.GetTimestamp();
+				bool duePeriodic = (nowTs - lastFullFlushTs) >= intervalTicks;
+				bool dueIdle = _options.EnableIdleFlush &&
+				               _effectiveWritePolicy == WritePolicy.WriteBack &&
+				               (nowTs - Volatile.Read(ref _lastIoTimestamp)) >= idleTicks &&
+				               HasAnyDirtyBlocks();
+
+				if (duePeriodic || dueIdle)
 				{
-					Log($"[Write-Back Flush] {flushed} ブロックを HDD へ同期しました。");
+					int flushed = SyncAll();
+					lastFullFlushTs = Stopwatch.GetTimestamp();
+					if (flushed > 0)
+					{
+						string reason = dueIdle && !duePeriodic ? "Idle Flush" : "Write-Back Flush";
+						Log($"[{reason}] {flushed} ブロックを HDD へ同期しました。");
+					}
 				}
 			}
 			catch (OperationCanceledException)
@@ -1759,6 +1983,13 @@ public sealed class HybridCacheEngine : IDisposable
 				Log($"[警告] バックグラウンドフラッシュエラー: {ex.Message}");
 			}
 		}
+	}
+
+	private bool HasAnyDirtyBlocks()
+	{
+		if (!_inFlightEvictions.IsEmpty) return true;
+		if (_ram.GetCounts().DirtyBlocks > 0) return true;
+		return _ssd.GetCounts().DirtyBlocks > 0;
 	}
 
 	private async Task AutoSaveLoopAsync(CancellationToken token)

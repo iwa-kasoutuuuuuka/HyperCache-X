@@ -20,6 +20,10 @@ public sealed class SessionProfile
 	public string? MountPoint { get; set; }
 	public int PerformanceModeIndex { get; set; } = 1;
 	public int FlushIntervalSeconds { get; set; } = 10;
+
+	public WorkloadPreset WorkloadPreset { get; set; } = WorkloadPreset.Balanced;
+
+	public bool EnableBatterySafeMode { get; set; } = true;
 }
 
 public sealed class RamDiskProfile
@@ -27,6 +31,8 @@ public sealed class RamDiskProfile
 	public string? MountPoint { get; set; }
 	public long CapacityMb { get; set; } = 2048;
 	public string VolumeLabel { get; set; } = "HCX_RAMDISK";
+	public string? BackupDirectory { get; set; }
+	public bool AutoPersist { get; set; }
 }
 
 public sealed class AppSettings
@@ -41,6 +47,10 @@ public sealed class AppSettings
 	public string? MountPoint { get; set; }
 	public int PerformanceModeIndex { get; set; } = 1;
 	public int FlushIntervalSeconds { get; set; } = 10;
+
+	public WorkloadPreset WorkloadPreset { get; set; } = WorkloadPreset.Balanced;
+
+	public bool EnableBatterySafeMode { get; set; } = true;
 	public string? RamDiskMountPoint { get; set; }
 	public long RamDiskCapacityMb { get; set; } = 2048;
 	public string RamDiskLabel { get; set; } = "HCX_RAMDISK";
@@ -167,7 +177,9 @@ public static class AppSettingsManager
 				{
 					MountPoint = mount,
 					CapacityMb = Math.Clamp(rp.CapacityMb, 64L, MaxCacheSizeMb),
-					VolumeLabel = SanitizeLabel(rp.VolumeLabel)
+					VolumeLabel = SanitizeLabel(rp.VolumeLabel),
+					BackupDirectory = SanitizeFsDirectory(rp.BackupDirectory, forbidInternalHcx: true),
+					AutoPersist = rp.AutoPersist
 				});
 				if (cleanRamDisks.Count >= MaxProfiles)
 				{

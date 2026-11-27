@@ -20,7 +20,7 @@ namespace HCX.Mcp;
 public sealed class HcxMcpServer : IDisposable
 {
 	public const string ServerName = "hypercache-x";
-	public const string ServerVersion = "2.3.0";
+	public const string ServerVersion = "2.4.0";
 	private const int MaxActiveSessions = 8;
 
 	private static readonly string[] SupportedProtocolVersions =
@@ -260,7 +260,40 @@ public sealed class HcxMcpServer : IDisposable
 					["cache_dir"] = Prop("string", "Directory containing HCX cache files."),
 					["scope"] = Prop("string", "ssd, ramdisk, or both (default both).")
 				},
-				new[] { "cache_dir" })
+				new[] { "cache_dir" }),
+
+			BuildToolSchema(
+				"hcx_warm_path",
+				"Pre-warm a file or directory into L1/L2 cache (optionally pinning it against LRU eviction) on an active MCP session or the live HCX.App desktop instance.",
+				new JsonObject
+				{
+					["relative_path"] = Prop("string", "Relative file or folder path inside the accelerated target root."),
+					["session_id"] = Prop("string", "Optional MCP session_id. Omit or pass 'live' to forward to running HCX.App via Named Pipe IPC."),
+					["max_mb"] = Prop("integer", "Maximum MB to pre-warm (1-1024, default 128)."),
+					["pin"] = Prop("boolean", "Pin warmed path so it stays prioritized in L1 (default false).")
+				},
+				new[] { "relative_path" }),
+
+			BuildToolSchema(
+				"hcx_get_hot_files",
+				"Get Top 10 hot files (hits, misses, hit rate, bytes) for an active MCP session or the live HCX.App desktop instance.",
+				new JsonObject
+				{
+					["session_id"] = Prop("string", "Optional MCP session_id. Omit or pass 'live' to query running HCX.App.")
+				},
+				Array.Empty<string>()),
+
+			BuildToolSchema(
+				"hcx_live_app_status",
+				"Query the live running HCX.App desktop instance over user-scoped Named Pipe IPC for active virtual drives, hit rates, prefetch counts, Top 10 hot files, and RAMDisks.",
+				new JsonObject(),
+				Array.Empty<string>()),
+
+			BuildToolSchema(
+				"hcx_live_app_sync",
+				"Trigger immediate SyncAll() on all active virtual drives in the live running HCX.App desktop instance via Named Pipe IPC.",
+				new JsonObject(),
+				Array.Empty<string>())
 		};
 
 		return BuildResultResponse(idNode, new JsonObject { ["tools"] = tools });
@@ -292,6 +325,10 @@ public sealed class HcxMcpServer : IDisposable
 				"hcx_sync_session" => ToolSyncSession(args),
 				"hcx_stop_session" => ToolStopSession(args),
 				"hcx_cleanup_cache" => ToolCleanupCache(args),
+				"hcx_warm_path" => ToolWarmPath(args),
+				"hcx_get_hot_files" => ToolGetHotFiles(args),
+				"hcx_live_app_status" => ToolLiveAppStatus(),
+				"hcx_live_app_sync" => ToolLiveAppSync(),
 				_ => throw new KeyNotFoundException($"Unknown tool: {toolName}")
 			};
 
@@ -581,6 +618,81 @@ public sealed class HcxMcpServer : IDisposable
 			ramDiskFilesDeleted = ramDiskDeleted,
 			totalDeleted = ssdDeleted + ramDiskDeleted
 		};
+	}
+
+	private object ToolWarmPath(JsonElement args)
+	{
+		string relPath = GetRequiredString(args, "relative_path");
+		string? sessionId = GetOptionalString(args, "session_id");
+		int maxMb = Math.Clamp(GetOptionalInt(args, "max_mb", 128), 1, 1024);
+		bool pin = GetOptionalBool(args, "pin", false);
+
+		if (string.IsNullOrWhiteSpace(sessionId) || string.Equals(sessionId, "live", StringComparison.OrdinalIgnoreCase))
+		{
+			if (!HcxControlPipeClient.TrySend("warm_path", new { relativePath = relPath, maxMb, pin }, out JsonNode? data, out string? error))
+			{
+				throw new InvalidOperationException(error ?? "Failed to reach live HCX.App.");
+			}
+			return new { source = "live-app", result = data };
+		}
+
+		if (!_sessions.TryGetValue(sessionId, out HybridCacheEngine? engine))
+		{
+			throw new ArgumentException($"Session not found: {sessionId}");
+		}
+
+		WarmResult res = engine.WarmPath(relPath, (long)maxMb * 1024L * 1024L, pin);
+		return new
+		{
+			source = "mcp-session",
+			sessionId,
+			res.FilesWarmed,
+			res.BlocksWarmed,
+			res.BytesWarmed,
+			res.Pinned
+		};
+	}
+
+	private object ToolGetHotFiles(JsonElement args)
+	{
+		string? sessionId = GetOptionalString(args, "session_id");
+		if (string.IsNullOrWhiteSpace(sessionId) || string.Equals(sessionId, "live", StringComparison.OrdinalIgnoreCase))
+		{
+			if (!HcxControlPipeClient.TrySend("get_live_stats", null, out JsonNode? data, out string? error))
+			{
+				throw new InvalidOperationException(error ?? "Failed to reach live HCX.App.");
+			}
+			return new { source = "live-app", live = data };
+		}
+
+		if (!_sessions.TryGetValue(sessionId, out HybridCacheEngine? engine))
+		{
+			throw new ArgumentException($"Session not found: {sessionId}");
+		}
+		return new
+		{
+			source = "mcp-session",
+			sessionId,
+			topHotFiles = engine.GetTopHotFiles(10)
+		};
+	}
+
+	private static object ToolLiveAppStatus()
+	{
+		if (!HcxControlPipeClient.TrySend("get_live_stats", null, out JsonNode? data, out string? error))
+		{
+			return new { connected = false, message = error };
+		}
+		return new { connected = true, live = data };
+	}
+
+	private static object ToolLiveAppSync()
+	{
+		if (!HcxControlPipeClient.TrySend("sync_all", null, out JsonNode? data, out string? error))
+		{
+			throw new InvalidOperationException(error ?? "Failed to reach live HCX.App.");
+		}
+		return new { connected = true, result = data };
 	}
 
 	private static object FormatSessionSnapshot(string sessionId, CacheStatsSnapshot snap)

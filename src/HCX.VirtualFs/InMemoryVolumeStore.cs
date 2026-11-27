@@ -899,6 +899,177 @@ public sealed class InMemoryVolumeStore
 		}
 	}
 
+	/// <summary>
+	/// Persists the entire in-memory directory tree and file contents to a host directory for restart recovery.
+	/// Rejects raw device paths and skips reparse points.
+	/// </summary>
+	public (int FilesSaved, int DirectoriesSaved, long BytesSaved) SaveToDirectory(string backupDirectory)
+	{
+		ValidateBackupDirectory(backupDirectory, mustExist: false);
+		string rootFull = Path.GetFullPath(backupDirectory);
+		Directory.CreateDirectory(rootFull);
+
+		int filesSaved = 0;
+		int dirsSaved = 0;
+		long bytesSaved = 0;
+
+		_lock.EnterReadLock();
+		try
+		{
+			SaveNodeRecursiveLocked(_root, rootFull, ref filesSaved, ref dirsSaved, ref bytesSaved);
+		}
+		finally
+		{
+			_lock.ExitReadLock();
+		}
+		return (filesSaved, dirsSaved, bytesSaved);
+	}
+
+	/// <summary>
+	/// Restores files and directories from a backup directory into the in-memory RAM disk within CapacityBytes.
+	/// </summary>
+	public (int FilesLoaded, int DirectoriesLoaded, long BytesLoaded) LoadFromDirectory(string backupDirectory)
+	{
+		ValidateBackupDirectory(backupDirectory, mustExist: false);
+		string rootFull = Path.GetFullPath(backupDirectory);
+		if (!Directory.Exists(rootFull))
+		{
+			return (0, 0, 0);
+		}
+
+		int filesLoaded = 0;
+		int dirsLoaded = 0;
+		long bytesLoaded = 0;
+
+		LoadDirectoryRecursive(rootFull, "\\", ref filesLoaded, ref dirsLoaded, ref bytesLoaded);
+		return (filesLoaded, dirsLoaded, bytesLoaded);
+	}
+
+	private void SaveNodeRecursiveLocked(Node dirNode, string currentHostDir, ref int filesSaved, ref int dirsSaved, ref long bytesSaved)
+	{
+		if (!dirNode.IsDirectory || dirNode.Children == null)
+		{
+			return;
+		}
+		foreach (Node child in dirNode.Children.Values)
+		{
+			if (string.IsNullOrEmpty(child.Name) || child.Name == "." || child.Name == ".." || child.Name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+			{
+				continue;
+			}
+			string targetPath = Path.Combine(currentHostDir, child.Name);
+			if (child.IsDirectory)
+			{
+				Directory.CreateDirectory(targetPath);
+				dirsSaved++;
+				SaveNodeRecursiveLocked(child, targetPath, ref filesSaved, ref dirsSaved, ref bytesSaved);
+			}
+			else
+			{
+				ReaderWriterLockSlim dataLock = GetDataLock(child);
+				dataLock.EnterReadLock();
+				try
+				{
+					using FileStream fs = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None);
+					long remaining = child.FileSize;
+					for (int p = 0; p < child.Pages.Count && remaining > 0; p++)
+					{
+						int toWrite = (int)Math.Min(remaining, PageSize);
+						fs.Write(child.Pages[p], 0, toWrite);
+						remaining -= toWrite;
+						bytesSaved += toWrite;
+					}
+					filesSaved++;
+				}
+				finally
+				{
+					dataLock.ExitReadLock();
+				}
+			}
+		}
+	}
+
+	private void LoadDirectoryRecursive(string hostDir, string virtualParent, ref int filesLoaded, ref int dirsLoaded, ref long bytesLoaded)
+	{
+		foreach (string dir in Directory.EnumerateDirectories(hostDir))
+		{
+			try
+			{
+				if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0) continue;
+				string name = Path.GetFileName(dir);
+				string vPath = virtualParent == "\\" ? "\\" + name : virtualParent + "\\" + name;
+				if (!Exists(vPath))
+				{
+					CreateEntry(vPath, isDirectory: true, (uint)FileAttributes.Directory, null, 0);
+					dirsLoaded++;
+				}
+				LoadDirectoryRecursive(dir, vPath, ref filesLoaded, ref dirsLoaded, ref bytesLoaded);
+			}
+			catch
+			{
+			}
+		}
+
+		foreach (string file in Directory.EnumerateFiles(hostDir))
+		{
+			try
+			{
+				if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) continue;
+				FileInfo fi = new FileInfo(file);
+				if (fi.Length > CapacityBytes) continue;
+
+				string name = Path.GetFileName(file);
+				string vPath = virtualParent == "\\" ? "\\" + name : virtualParent + "\\" + name;
+				InMemoryNodeHandle handle;
+				if (!TryOpenHandle(vPath, out InMemoryNodeHandle? existing, out _))
+				{
+					CreateEntryWithHandle(vPath, isDirectory: false, (uint)FileAttributes.Archive, null, 0, out handle);
+				}
+				else
+				{
+					handle = existing!;
+				}
+
+				byte[] chunkBuf = new byte[PageSize];
+				using FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+				ulong offset = 0;
+				while (true)
+				{
+					int read = fs.Read(chunkBuf, 0, chunkBuf.Length);
+					if (read <= 0) break;
+					WriteFileByHandle(handle, offset, chunkBuf.AsSpan(0, read), writeToEndOfFile: false, constrainedIo: false, out uint written);
+					offset += written;
+					bytesLoaded += written;
+				}
+				filesLoaded++;
+			}
+			catch (IOException ex) when (ex.HResult == ErrorDiskFullHResult)
+			{
+				break;
+			}
+			catch
+			{
+			}
+		}
+	}
+
+	private static void ValidateBackupDirectory(string backupDirectory, bool mustExist)
+	{
+		if (string.IsNullOrWhiteSpace(backupDirectory) || backupDirectory.IndexOf('\0') >= 0)
+		{
+			throw new ArgumentException("Backup directory path is invalid.", nameof(backupDirectory));
+		}
+		if (backupDirectory.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+		    backupDirectory.StartsWith(@"\\.\", StringComparison.Ordinal))
+		{
+			throw new ArgumentException("Raw device paths are disallowed for RAM disk backup.", nameof(backupDirectory));
+		}
+		if (mustExist && !Directory.Exists(Path.GetFullPath(backupDirectory)))
+		{
+			throw new DirectoryNotFoundException($"Backup directory not found: {backupDirectory}");
+		}
+	}
+
 	private Node CreateRootNode()
 	{
 		long now = DateTime.UtcNow.ToFileTimeUtc();

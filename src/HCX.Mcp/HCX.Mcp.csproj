@@ -5,7 +5,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>HCX.Mcp</AssemblyName>
-    <Version>2.3.0</Version>
+    <Version>2.4.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

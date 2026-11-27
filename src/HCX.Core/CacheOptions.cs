@@ -46,6 +46,12 @@ public sealed class CacheOptions
 
 	public int ReadAheadBlocks { get; set; } = 2;
 
+	public bool EnableIdleFlush { get; set; } = true;
+
+	public TimeSpan IdleFlushDelay { get; set; } = TimeSpan.FromSeconds(3);
+
+	public WorkloadPreset WorkloadPreset { get; set; } = WorkloadPreset.Balanced;
+
 	public double SsdPromoteScore { get; set; } = 1.2;
 
 	public double RamPromoteScore { get; set; } = 2.0;

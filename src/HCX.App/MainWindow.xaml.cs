@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -47,10 +48,15 @@ public partial class MainWindow : Window
 
 	private readonly List<EngineSession> _sessions = new List<EngineSession>();
 	private readonly List<RamDiskHost> _ramDiskHosts = new List<RamDiskHost>();
+	private readonly Dictionary<RamDiskHost, (string BackupDir, bool AutoPersist)> _ramDiskPersistence = new Dictionary<RamDiskHost, (string, bool)>();
 	private readonly System.Windows.Shapes.Rectangle[] _heatmapRects = new System.Windows.Shapes.Rectangle[256];
 	private readonly Queue<string> _logLines = new Queue<string>();
+	private readonly Queue<double> _throughputHistory = new Queue<double>();
+	private readonly Queue<double> _hitRateHistory = new Queue<double>();
 	private readonly bool _startMinimized;
 
+	private HcxControlPipeServer? _controlPipeServer;
+	private bool _batterySafeModeActive;
 	private DispatcherTimer? _updateTimer;
 	private long _lastIoBytes;
 	private DateTime _lastUpdateUtc = DateTime.UtcNow;
@@ -90,7 +96,8 @@ public partial class MainWindow : Window
 			Hide();
 		}
 
-		Log("HyperCache X v2.3.0 起動中 (ディスク情報を非同期読み込みしています)...");
+		Log("HyperCache X v2.4.0 起動中 (ディスク情報を非同期読み込みしています)...");
+		StartControlPipeServer();
 		Dispatcher.BeginInvoke(() => _ = InitializeAsync(), DispatcherPriority.Loaded);
 	}
 
@@ -108,7 +115,9 @@ public partial class MainWindow : Window
 		await RefreshDisksAndOptionsAsync();
 
 		ApplySavedSettingsToUi(_settings);
-		Log("HyperCache X v2.3.0 準備完了 (シャード化L1/L2 + MMF RAMDisk + 非同期先読み)。");
+		ChkBatterySafe.IsChecked = _settings.EnableBatterySafeMode;
+		SelectWorkloadPresetCombo(_settings.WorkloadPreset);
+		Log("HyperCache X v2.4.0 準備完了 (シャードL1/L2 + MMF + 先読み + ライブMCP IPC)。");
 
 		DiskInfo? preferredRam = DiskUtility.FindPreferredRamDisk(_cachedDisks);
 		if (preferredRam != null)
@@ -128,7 +137,7 @@ public partial class MainWindow : Window
 						continue;
 					}
 					if (!string.IsNullOrWhiteSpace(rp.MountPoint) &&
-					    CreateAndMountRamDisk(rp.MountPoint, rp.CapacityMb, rp.VolumeLabel, isAutoRestore: true))
+					    CreateAndMountRamDisk(rp.MountPoint, rp.CapacityMb, rp.VolumeLabel, isAutoRestore: true, rp.BackupDirectory, rp.AutoPersist))
 					{
 						mountedAnyRamDisk = true;
 					}
@@ -203,7 +212,7 @@ public partial class MainWindow : Window
 
 		_notifyIcon.ContextMenuStrip = _trayMenu;
 		_notifyIcon.Visible = true;
-		_notifyIcon.Text = "HyperCache X v2.3.0 - 準備完了";
+		_notifyIcon.Text = "HyperCache X v2.4.0 - 準備完了";
 		_notifyIcon.DoubleClick += (_, _) => ShowWindow();
 		RefreshTrayMenu();
 	}
@@ -273,6 +282,15 @@ public partial class MainWindow : Window
 		try
 		{
 			SystemEvents.SessionEnding -= OnSystemSessionEnding;
+		}
+		catch
+		{
+		}
+
+		try
+		{
+			_controlPipeServer?.Dispose();
+			_controlPipeServer = null;
 		}
 		catch
 		{
@@ -784,6 +802,7 @@ public partial class MainWindow : Window
 				SsdCacheSizeBytes = l2Mb * 1024L * 1024L,
 				WritePolicy = policy,
 				FlushInterval = TimeSpan.FromSeconds(flushSeconds),
+				WorkloadPreset = GetSelectedWorkloadPreset(),
 				AiInterval = aiInterval,
 				SsdPromoteScore = ssdThresh,
 				RamPromoteScore = ramThresh
@@ -842,6 +861,7 @@ public partial class MainWindow : Window
 
 			BtnStop.IsEnabled = true;
 			BtnSyncNow.IsEnabled = true;
+			BtnWarmPath.IsEnabled = true;
 			BtnClearL2Cache.IsEnabled = false;
 			StatusDot.Fill = System.Windows.Media.Brushes.LimeGreen;
 			TxtStatusLabel.Text = "オンライン";
@@ -942,7 +962,9 @@ public partial class MainWindow : Window
 
 		long capMb = GetSelectedTagLong(RamDiskCapacityCombo, 2048);
 		string label = string.IsNullOrWhiteSpace(TxtRamDiskLabel.Text) ? "HCX_RAMDISK" : TxtRamDiskLabel.Text.Trim();
-		if (CreateAndMountRamDisk(mountPoint, capMb, label, isAutoRestore: false))
+		string? backupDir = string.IsNullOrWhiteSpace(TxtRamDiskBackupDir.Text) ? null : TxtRamDiskBackupDir.Text.Trim();
+		bool autoPersist = ChkRamDiskPersist.IsChecked == true && !string.IsNullOrWhiteSpace(backupDir);
+		if (CreateAndMountRamDisk(mountPoint, capMb, label, isAutoRestore: false, backupDir, autoPersist))
 		{
 			SaveCurrentSettings();
 			EnsureTimerRunning();
@@ -952,7 +974,7 @@ public partial class MainWindow : Window
 		}
 	}
 
-	private bool CreateAndMountRamDisk(string mountPoint, long capMb, string label, bool isAutoRestore)
+	private bool CreateAndMountRamDisk(string mountPoint, long capMb, string label, bool isAutoRestore, string? backupDir = null, bool autoPersist = false)
 	{
 		try
 		{
@@ -976,11 +998,20 @@ public partial class MainWindow : Window
 			}
 
 			RamDiskHost host = new RamDiskHost(capBytes, label);
+			if (autoPersist && !string.IsNullOrWhiteSpace(backupDir) && Directory.Exists(backupDir))
+			{
+				(int loadedFiles, int loadedDirs, long loadedBytes) = host.Store.LoadFromDirectory(backupDir);
+				Log($"[永続 RAMDisk 復元] {backupDir} から {loadedFiles} ファイル / {loadedDirs} フォルダ ({loadedBytes / (1024.0 * 1024.0):F2} MB) を読み込みました。");
+			}
 			host.Mount(mountPoint);
 			_ramDiskHosts.Add(host);
+			if (!string.IsNullOrWhiteSpace(backupDir))
+			{
+				_ramDiskPersistence[host] = (backupDir, autoPersist);
+			}
 
 			BtnUnmountAllRamDisks.IsEnabled = true;
-			Log($"内蔵 RAMディスクを作成・マウントしました: {mountPoint}\\ ({capMb} MB, Label={label})");
+			Log($"内蔵 RAMディスクを作成・マウントしました: {mountPoint}\\ ({capMb} MB, Label={label}, Persist={autoPersist})");
 			return true;
 		}
 		catch (Exception ex)
@@ -1013,9 +1044,23 @@ public partial class MainWindow : Window
 		}
 		foreach (RamDiskHost host in _ramDiskHosts)
 		{
+			if (_ramDiskPersistence.TryGetValue(host, out (string BackupDir, bool AutoPersist) persist) &&
+			    persist.AutoPersist && !string.IsNullOrWhiteSpace(persist.BackupDir))
+			{
+				try
+				{
+					(int savedFiles, int savedDirs, long savedBytes) = host.Store.SaveToDirectory(persist.BackupDir);
+					Log($"[永続 RAMDisk 保存] {persist.BackupDir} へ {savedFiles} ファイル / {savedDirs} フォルダ ({savedBytes / (1024.0 * 1024.0):F2} MB) を退避しました。");
+				}
+				catch (Exception ex)
+				{
+					Log($"[警告] 永続 RAMDisk バックアップ失敗: {ex.Message}");
+				}
+			}
 			try { host.Dispose(); } catch { }
 		}
 		_ramDiskHosts.Clear();
+		_ramDiskPersistence.Clear();
 		if (Dispatcher.CheckAccess())
 		{
 			BtnUnmountAllRamDisks.IsEnabled = false;
@@ -1127,8 +1172,12 @@ public partial class MainWindow : Window
 
 		if (_notifyIcon != null)
 		{
-			_notifyIcon.Text = $"HCX v2.3.0 - {_sessions.Count}件稼働 (Hit: {hitRate:F1}%)";
+			_notifyIcon.Text = $"HCX v2.4.0 - {_sessions.Count}件稼働 (Hit: {hitRate:F1}%)";
 		}
+
+		UpdateSparklines(mbPerSec, hitRate);
+		UpdateHotFilesDisplay(snapshots);
+		CheckBatterySafeMode();
 		RefreshTrayMenu();
 	}
 
@@ -1233,16 +1282,296 @@ public partial class MainWindow : Window
 
 			BtnStop.IsEnabled = false;
 			BtnSyncNow.IsEnabled = false;
+			BtnWarmPath.IsEnabled = false;
 			BtnClearL2Cache.IsEnabled = true;
+			TxtHotFilesTop10.Text = "ホットファイル Top 10: 待機中...";
 			StatusDot.Fill = System.Windows.Media.Brushes.Crimson;
 			TxtStatusLabel.Text = "停止中";
 			TxtStatusLabel.Foreground = System.Windows.Media.Brushes.Crimson;
 		}
 		if (_notifyIcon != null)
 		{
-			_notifyIcon.Text = "HyperCache X v2.3.0 - 準備完了";
+			_notifyIcon.Text = "HyperCache X v2.4.0 - 準備完了";
 		}
 		Log("すべての仮想ドライブを安全にアンマウントし、HDD 同期を完了しました。");
+	}
+
+	private void SelectWorkloadPresetCombo(WorkloadPreset preset)
+	{
+		string target = preset.ToString();
+		for (int i = 0; i < WorkloadPresetCombo.Items.Count; i++)
+		{
+			if (WorkloadPresetCombo.Items[i] is ComboBoxItem item &&
+			    string.Equals(item.Tag?.ToString(), target, StringComparison.OrdinalIgnoreCase))
+			{
+				WorkloadPresetCombo.SelectedIndex = i;
+				return;
+			}
+		}
+	}
+
+	private WorkloadPreset GetSelectedWorkloadPreset()
+	{
+		if (WorkloadPresetCombo?.SelectedItem is ComboBoxItem item &&
+		    Enum.TryParse<WorkloadPreset>(item.Tag?.ToString(), ignoreCase: true, out WorkloadPreset preset))
+		{
+			return preset;
+		}
+		return WorkloadPreset.Balanced;
+	}
+
+	private void WorkloadPresetCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+	{
+		if (!IsLoaded) return;
+		WorkloadPreset preset = GetSelectedWorkloadPreset();
+		foreach (EngineSession s in _sessions)
+		{
+			s.Engine.ApplyWorkloadPreset(preset);
+		}
+	}
+
+	private void BtnBrowseRamDiskBackup_Click(object sender, RoutedEventArgs e)
+	{
+		using FolderBrowserDialog dlg = new FolderBrowserDialog
+		{
+			Description = "内蔵 RAMディスクの永続バックアップ先フォルダを選択してください"
+		};
+		if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+		{
+			TxtRamDiskBackupDir.Text = dlg.SelectedPath;
+			ChkRamDiskPersist.IsChecked = true;
+		}
+	}
+
+	private async void BtnWarmPath_Click(object sender, RoutedEventArgs e)
+	{
+		if (_sessions.Count == 0) return;
+		EngineSession target = _sessions[0];
+		using FolderBrowserDialog dlg = new FolderBrowserDialog
+		{
+			Description = $"事前ウォームアップするフォルダを選択してください ({target.Engine.TargetRootPath} 配下)",
+			InitialDirectory = target.Engine.TargetRootPath
+		};
+		if (dlg.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
+
+		string selected = Path.GetFullPath(dlg.SelectedPath);
+		string root = target.Engine.TargetRootPath.TrimEnd('\\');
+		if (!selected.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+		{
+			System.Windows.MessageBox.Show($"選択フォルダは加速ターゲット ({root}) 配下である必要があります。", "事前ウォームアップ", MessageBoxButton.OK, MessageBoxImage.Warning);
+			return;
+		}
+
+		string rel = selected.Length <= root.Length ? string.Empty : selected.Substring(root.Length).TrimStart('\\');
+		MessageBoxResult pinChoice = System.Windows.MessageBox.Show(
+			"ウォームアップしたファイルを L1 優先ピン留め（Pinning）しますか？",
+			"事前ウォームアップ",
+			MessageBoxButton.YesNo,
+			MessageBoxImage.Question);
+		bool pin = pinChoice == MessageBoxResult.Yes;
+
+		BtnWarmPath.IsEnabled = false;
+		try
+		{
+			WarmResult res = await Task.Run(() => target.Engine.WarmPath(rel, 256L * 1024 * 1024, pin));
+			UpdateStats();
+			System.Windows.MessageBox.Show(
+				$"事前ウォームアップ完了:\nファイル数: {res.FilesWarmed}\nブロック数: {res.BlocksWarmed}\n容量: {res.BytesWarmed / (1024.0 * 1024.0):F2} MB\nPin: {res.Pinned}",
+				"事前ウォームアップ",
+				MessageBoxButton.OK,
+				MessageBoxImage.Information);
+		}
+		catch (Exception ex)
+		{
+			Log($"[Pre-Warm エラー] {ex.Message}");
+			System.Windows.MessageBox.Show($"ウォームアップエラー: {ex.Message}");
+		}
+		finally
+		{
+			BtnWarmPath.IsEnabled = _sessions.Count > 0;
+		}
+	}
+
+	private void BtnExportReport_Click(object sender, RoutedEventArgs e)
+	{
+		Microsoft.Win32.SaveFileDialog dlg = new Microsoft.Win32.SaveFileDialog
+		{
+			Filter = "JSON レポート (*.json)|*.json",
+			FileName = $"HCX_Report_{DateTime.Now:yyyyMMdd_HHmmss}.json"
+		};
+		if (dlg.ShowDialog() != true) return;
+
+		object report = new
+		{
+			exportedAtUtc = DateTime.UtcNow,
+			version = "2.4.0",
+			throughputHistoryMbPerSec = _throughputHistory.ToArray(),
+			hitRateHistoryPercent = _hitRateHistory.ToArray(),
+			sessions = _sessions.Select(s => s.Engine.GetStatsSnapshot()).ToArray(),
+			ramDisks = _ramDiskHosts.Select(r => new { r.MountedPoint, r.VolumeLabel, stats = r.Store.GetStats() }).ToArray()
+		};
+		string json = JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true });
+		File.WriteAllText(dlg.FileName, json);
+		Log($"[レポート出力] 診断レポートを保存しました: {dlg.FileName}");
+	}
+
+	private void UpdateSparklines(double mbPerSec, double hitRate)
+	{
+		const int maxPoints = 60;
+		_throughputHistory.Enqueue(mbPerSec);
+		while (_throughputHistory.Count > maxPoints) _throughputHistory.Dequeue();
+		_hitRateHistory.Enqueue(hitRate);
+		while (_hitRateHistory.Count > maxPoints) _hitRateHistory.Dequeue();
+
+		double w = SparklineCanvas.Width;
+		double h = SparklineCanvas.Height;
+		double maxMb = Math.Max(10.0, _throughputHistory.Max());
+
+		PointCollection tpPoints = new PointCollection();
+		PointCollection hrPoints = new PointCollection();
+		double[] tpArr = _throughputHistory.ToArray();
+		double[] hrArr = _hitRateHistory.ToArray();
+		double step = maxPoints > 1 ? w / (maxPoints - 1) : w;
+		int offset = maxPoints - tpArr.Length;
+
+		for (int i = 0; i < tpArr.Length; i++)
+		{
+			double x = (offset + i) * step;
+			double yTp = h - Math.Clamp(tpArr[i] / maxMb, 0.0, 1.0) * (h - 4) - 2;
+			double yHr = h - Math.Clamp(hrArr[i] / 100.0, 0.0, 1.0) * (h - 4) - 2;
+			tpPoints.Add(new System.Windows.Point(x, yTp));
+			hrPoints.Add(new System.Windows.Point(x, yHr));
+		}
+		ThroughputSparkline.Points = tpPoints;
+		HitRateSparkline.Points = hrPoints;
+	}
+
+	private void UpdateHotFilesDisplay(List<CacheStatsSnapshot> snapshots)
+	{
+		HotFileStat[] top = snapshots
+			.SelectMany(s => s.TopHotFiles)
+			.OrderByDescending(f => f.Hits + f.Misses)
+			.Take(5)
+			.ToArray();
+
+		if (top.Length == 0)
+		{
+			TxtHotFilesTop10.Text = "ホットファイル Top 10: アクセス待機中...";
+			return;
+		}
+		TxtHotFilesTop10.Text = "ホットファイル Top: " + string.Join(" | ", top.Select(f =>
+			$"{Path.GetFileName(f.RelativePath)}({f.HitRatePercent:F0}%/{f.Hits + f.Misses})"));
+	}
+
+	private void CheckBatterySafeMode()
+	{
+		if (ChkBatterySafe.IsChecked != true || _sessions.Count == 0) return;
+		try
+		{
+			PowerStatus ps = SystemInformation.PowerStatus;
+			bool lowBattery = ps.PowerLineStatus == System.Windows.Forms.PowerLineStatus.Offline && ps.BatteryLifePercent <= 0.20f && ps.BatteryLifePercent >= 0f;
+			if (lowBattery && !_batterySafeModeActive)
+			{
+				_batterySafeModeActive = true;
+				foreach (EngineSession s in _sessions)
+				{
+					s.Engine.SetWritePolicy(WritePolicy.WriteThrough);
+				}
+				Log($"[バッテリー保護] 残量低下 ({ps.BatteryLifePercent * 100:F0}%) を検知: 全セッションを WriteThrough へ切替・同期しました。");
+			}
+			else if (!lowBattery && _batterySafeModeActive && ps.PowerLineStatus == System.Windows.Forms.PowerLineStatus.Online)
+			{
+				_batterySafeModeActive = false;
+				Log("[バッテリー保護] AC 電源復帰を検知しました。");
+			}
+		}
+		catch
+		{
+		}
+	}
+
+	private void StartControlPipeServer()
+	{
+		try
+		{
+			_controlPipeServer = new HcxControlPipeServer(HandleControlPipeRequest);
+		}
+		catch (Exception ex)
+		{
+			Log($"[警告] ライブ MCP IPC サーバーの起動に失敗しました: {ex.Message}");
+		}
+	}
+
+	private object HandleControlPipeRequest(string action, JsonElement payload)
+	{
+		return Dispatcher.Invoke<object>(() =>
+		{
+			switch (action)
+			{
+				case "ping":
+					return new { version = "2.4.0", sessions = _sessions.Count, ramDisks = _ramDiskHosts.Count };
+
+				case "get_live_stats":
+					return new
+					{
+						version = "2.4.0",
+						sessionCount = _sessions.Count,
+						sessions = _sessions.Select(s =>
+						{
+							CacheStatsSnapshot snap = s.Engine.GetStatsSnapshot();
+							return new
+							{
+								s.DisplayLabel,
+								snap.TargetRootPath,
+								snap.MountPoint,
+								snap.L1BackendSummary,
+								writePolicy = snap.WritePolicy.ToString(),
+								workloadPreset = snap.WorkloadPreset.ToString(),
+								hitRatePercent = Math.Round(snap.HitRatePercent, 2),
+								snap.RamHits,
+								snap.SsdHits,
+								snap.HddMisses,
+								snap.SequentialBypasses,
+								snap.PrefetchedBlocks,
+								snap.DirtyBlocks,
+								topHotFiles = snap.TopHotFiles
+							};
+						}).ToArray(),
+						ramDisks = _ramDiskHosts.Select(r => new
+						{
+							r.MountedPoint,
+							r.VolumeLabel,
+							stats = r.Store.GetStats()
+						}).ToArray()
+					};
+
+				case "sync_all":
+				{
+					int totalFlushed = 0;
+					foreach (EngineSession s in _sessions)
+					{
+						totalFlushed += s.Engine.SyncAll();
+					}
+					return new { sessionCount = _sessions.Count, totalFlushedBlocks = totalFlushed };
+				}
+
+				case "warm_path":
+				{
+					if (_sessions.Count == 0)
+					{
+						throw new InvalidOperationException("No active HCX.App acceleration session running.");
+					}
+					string relPath = payload.TryGetProperty("relativePath", out JsonElement rp) ? (rp.GetString() ?? string.Empty) : string.Empty;
+					int maxMb = payload.TryGetProperty("maxMb", out JsonElement mm) && mm.TryGetInt32(out int v) ? Math.Clamp(v, 1, 1024) : 128;
+					bool pin = payload.TryGetProperty("pin", out JsonElement pn) && pn.ValueKind == JsonValueKind.True;
+					WarmResult res = _sessions[0].Engine.WarmPath(relPath, (long)maxMb * 1024L * 1024L, pin);
+					return res;
+				}
+
+				default:
+					throw new ArgumentException($"Unknown IPC action: {action}");
+			}
+		});
 	}
 
 	private void Log(string message)

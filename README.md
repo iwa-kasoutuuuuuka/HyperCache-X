@@ -1,121 +1,73 @@
-# HyperCache X (HCX) v2.3.0
+# HyperCache X (HCX) v2.4.0
 
-低速な HDD の I/O を、**Tier 1 (既存 RAMDisk MMF 優先 / プロセス内 RAM) + Tier 2 (高速 SSD 上の専用キャッシュファイル)** の 3 階層ハイブリッドキャッシュで安全かつ高並列に高速化する Windows 向けユーザーモード・ストレージ加速エンジン＋仮想 RAM ディスクツールです。
+低速な HDD の I/O を、**Tier 1 (既存 RAMDisk MMF 優先 / プロセス内 RAM) + Tier 2 (高速 SSD 上の専用キャッシュファイル)** の 3 階層ハイブリッドキャッシュで安全かつ高並列に高速化する Windows 向けユーザーモード・ストレージ加速エンジン＋永続化対応仮想 RAM ディスク＋MCP サーバーです。
 
 ---
 
-## v2.3.0 の主な新機能・高速化・改善ポイント
+## v2.4.0 の主な新機能
 
-- **全階層キャッシュのシャード並列化（L1 RAM 16シャード / L1 RAMDisk 16シャード / L2 SSD 8シャード）**:
-  - `RamCacheTier`・`RamDiskFileCacheTier`・`SsdFileCacheTier` をシャード単位の `ReaderWriterLockSlim` へ分割し、NVMe Queue Depth やマルチコア並列読み書きのスケーラビリティを大幅に引き上げました。
-  - 満杯時の空シャード衝突でも他シャードから自動退避するフォールバックと、ダーティブロック 0 件時のロックゼロスキップを備えています。
-- **外部 RAMDisk L1 の `MemoryMappedFile` ゼロシステムコール化**:
-  - `RamDiskFileCacheTier` が `MemoryMappedFile` + `unsafe Span` 直接転送に対応し、GC 負荷ゼロのままカーネル遷移を排除しました（空き容量・アドレス空間不足時は `RandomAccess` へ自動フォールバック）。
-- **`AiAccessScorer` ロック競合解消 & L1 ヒット時軽量パス**:
-  - 毎ブロック発生していた `ConcurrentDictionary.Count` 全ロックを廃止し、L1 ヒット時はサンプリング軽量更新（`RecordL1HitLightweight`）で CPU・ロック競合を大幅削減。
-- **シーケンシャル一括バッチ Read & 非同期シーケンシャル先読み（Read-Ahead）**:
-  - クリーンファイルへのシーケンシャルバイパス時は残り領域を 1 回の `RandomAccess.Read` で直接一括転送。
-  - 有界チャネル（最大 32 ブロック）＋ノンブロッキング読み取りロックによるバックグラウンド先読みワーカーを追加し、`CacheStatsSnapshot` および UI へ先読みブロック数（`先読`）を表示します。
-- **仮想 FS メタデータ高速化 & 内蔵 RAM ディスク並列化**:
-  - `HcxFileSystem.ToFullPath` のジャンクション境界検証を Win32 `GetFileAttributesW` 1 回呼び出し＋ゼロアロケーション走査へ統合し、`Open` / `GetSecurityByName` の重複システムコールも排除。
-  - `InMemoryVolumeStore` / `MemoryFileSystem` にノード直参照ハンドル（`InMemoryNodeHandle`）・固定 64 ストライプ `ReaderWriterLockSlim`・CAS 容量管理・`Clear()` 世代管理を導入し、複数ファイル同時書き込みを完全並列化。
+- **稼働中 `HCX.App` ↔ `HCX.Mcp` ライブ連携（Named Pipe IPC）**:
+  - 現ユーザー SID のみにアクセス許可を絞ったローカル Named Pipe（`HcxControlPipeServer`）を `HCX.App` に搭載。Antigravity / Claude Code から稼働中の `HCX.App` 本体のリアルタイム統計取得（`hcx_live_app_status`）、即時同期（`hcx_live_app_sync`）、事前ウォームアップ（`hcx_warm_path`）、ホットファイル Top 10 取得（`hcx_get_hot_files`）が可能です。
+- **事前ウォームアップ（Pre-Warm）＆ ホットファイルピン留め（Pinning）**:
+  - ゲームのアセットフォルダや開発プロジェクトを起動前に一括先読みし、L1 優先ピン留めでコールドスタートを解消します（UI ボタン＋MCP ツール両対応）。
+- **永続 RAM ディスクモード（終了時自動保存・起動時自動復元）**:
+  - 内蔵 WinFsp RAM ディスク（`InMemoryVolumeStore`）に `SaveToDirectory` / `LoadFromDirectory` を追加。バックアップ先フォルダを指定することで、RAM 速度のまま再起動を跨いでデータを維持できます。
+- **拡張子・パス別フィルタ＆ワークロード別プリセット**:
+  - `Balanced` / `Gaming` / `Development` / `MediaEditing` の 4 プリセットを搭載。動画・圧縮アーカイブ（`.mp4`, `.mkv`, `.zip` 等）は先頭から即バイパスして汚染を防ぎ、`.pak`, `.dll`, `.db`, `.cs` 等を初回から L1 優先昇格します。
+- **アイドル時先行フラッシュ & バッテリー低下時セーフモード**:
+  - Write-Back 稼働中でも I/O が途切れたアイドル時（既定 3 秒）に Dirty ブロックを先行同期。ノート PC でバッテリー残量 ≦ 20% になると自動で `WriteThrough` へ切替＆即時 `SyncAll()` します。
+- **ホットファイル Top 10 可視化・60 秒リアルタイムスパークライン・JSON レポート出力**:
+  - スループット／ヒット率の 60 秒推移グラフ、ホットファイル Top 10 表示、診断レポート JSON エクスポートをダッシュボードに追加。
 
-### これまでの v2.2.x / v2.1.x 基盤機能
+### これまでの v2.3.x / v2.2.x / v2.1.x 基盤機能
 
-- **二重起動防止 & 既存ウィンドウ復帰**: `Local\HyperCacheX_SingleInstance_Mutex`＋イベント IPC で多重起動を防止し、既存画面を前面復帰。
-- **複数ドライブ & RAM ディスクのプロファイル永続化**: `SavedSessions` / `SavedRamDisks` を `%LOCALAPPDATA%\HyperCacheX\settings.json` へ保存し自動復元。
-- **Write-Back 同期間隔 UI（1〜60 秒） & L1 RAM 50% 超過確認ダイアログ**。
-- **デュアル配布パッケージ (`scripts/build-release.ps1`)**: Self-Contained 版 / Portable 版の 2 種 ZIP、`SHA256SUMS.txt`、`-CertThumbprint` 署名フック対応。
-- **WinFsp 実機マウント E2E スクリプト (`scripts/run-winfsp-e2e.ps1`)**。
+- **全階層キャッシュのシャード並列化**: `RamCacheTier`（最大 16 シャード）、`RamDiskFileCacheTier`（最大 16 シャード + `MemoryMappedFile` ゼロシステムコール）、`SsdFileCacheTier`（最大 8 シャード並列 NVMe I/O）＋空シャード退避フォールバック。
+- **高速化エンジン**: `AiAccessScorer` ロック競合解消＆L1 ヒット時軽量パス、シーケンシャル一括バッチ Read、有界チャネルによる非同期シーケンシャル先読み（Read-Ahead）、`HcxFileSystem` の Win32 `GetFileAttributesW` 1 回化、`InMemoryVolumeStore` 固定 64 ストライプ＆世代ハンドル管理。
+- **運用・配布**: 二重起動防止（Mutex＋IPC）、複数ドライブ・RAMDisk プロファイル永続化、デュアル ZIP パッケージ（`HCX.App.exe` + `HCX.Mcp.exe` 同梱）＋`SHA256SUMS.txt`、WinFsp 実機 E2E スクリプト。
 
 ---
 
 ## セキュリティ・堅牢性設計
 
-- **生ディスク／生ボリューム書き込み禁止**: `CacheOptions.Validate()` および `AppSettingsManager.Sanitize()` により `\\?\` / `\\.\` の生デバイス・ボリュームパスを拒否します。
-- **パストラバーサル & リンク越境 & 再帰キャッシュ防止**: 字句境界検証、`..`・NUL バイト・`.hcx` / `.hcx_bench_*` の遮断に加え、ジャンクション・シンボリックリンクの解決先ルート境界チェックおよび孤立ファイル削除時の Reparse Point スキップを実施します。
-- **ネイティブポインタ & インメモリ境界保護**: `HcxFileSystem` / `MemoryFileSystem` の `IntPtr.Zero` 拒否、`InMemoryVolumeStore` の容量上限 (`ERROR_DISK_FULL`)・整数オーバーフロー・循環リネーム・世代管理による旧ハンドル遮断・不正セキュリティ記述子検証、`SafeFileHandle` ベースの P/Invoke を徹底。
-- **メタデータ・設定・スタートアップ保護**: `MetadataManager` の SHA-256＋件数/残バイト検証、`AppSettingsManager` の HKCU `Run` 引用符・制御文字・UNC 拒否。
-- **最小権限 & 依存パッケージ監査**: `asInvoker` マニフェスト。NuGet 依存パッケージ脆弱性スキャンで既知脆弱性 **0 件**。
-
----
-
-## プロジェクト構成
-
-- [`src/HCX.Core`](src/HCX.Core/HCX.Core.csproj): 3 階層キャッシュエンジン・設定管理 (`HybridCacheEngine`, `IL1CacheTier`, `RamCacheTier`, `RamDiskFileCacheTier`, `SsdFileCacheTier`, `AiAccessScorer`, `MetadataManager`, `AppSettingsManager`, `DiskUtility`, `CacheBenchmarkRunner`)
-- [`src/HCX.VirtualFs`](src/HCX.VirtualFs/HCX.VirtualFs.csproj): WinFsp 連携仮想ファイルシステム (`HcxFileSystem`, `VirtualDriveHost`, `InMemoryVolumeStore`, `MemoryFileSystem`, `RamDiskHost`, `WinFspRuntime`)
-- [`src/HCX.App`](src/HCX.App/HCX.App.csproj): ダークモード WPF ダッシュボード（ハイブリッド加速 / 内蔵 RAM ディスクの 2 タブ構成、リアルタイム 32×8 ヒートマップ、単一起動制御、複数プロファイル自動復元、先読み・Seq 除外統計表示）
-- [`src/HCX.Mcp`](src/HCX.Mcp/HCX.Mcp.csproj): 外部依存ゼロの **MCP (Model Context Protocol) JSON-RPC 2.0 stdio サーバー**（Antigravity / Claude Code 両対応、`HCX.Mcp.exe`）
-- [`tests/HCX.Tests`](tests/HCX.Tests/HCX.Tests.csproj): xUnit 自動テストスイート（**59 件**）
-- [`scripts/build-release.ps1`](scripts/build-release.ps1): テスト＋Self-Contained / Portable デュアル ZIP＋オプション署名＋`SHA256SUMS.txt` 生成スクリプト
-- [`scripts/run-winfsp-e2e.ps1`](scripts/run-winfsp-e2e.ps1): WinFsp 実機マウント E2E 検証スクリプト
-
----
-
-## ビルド・テスト・配布パッケージ作成 (v2.3.0)
-
-- **ビルド**: `Debug` / `Release` ともに **0 警告 / 0 エラー**
-- **自動テスト**: `dotnet test HCX.sln -c Release --no-build` — **59 / 59 件合格**（MCP JSON-RPC 2.0 ハンドシェイク・全8ツール、16シャード並列、空シャード退避、MMF RAMDisk、非同期先読み、世代ハンドル無効化、ジャンクション越境遮断、実機 `R:\` RAMDisk ベンチマーク等を含む。WinFsp 未導入時は実マウント E2E を安全スキップ）
-- **依存関係脆弱性**: `dotnet list HCX.sln package --vulnerable --include-transitive` — **0 件**
-
-### コマンド一覧
-
-必要環境: **.NET 10 SDK**（Windows）
-
-```powershell
-dotnet restore HCX.sln
-dotnet build HCX.sln -c Release --no-restore
-dotnet test HCX.sln -c Release --no-build
-
-# 配布 ZIP 2種 (Self-Contained / Portable) + SHA256SUMS.txt の生成
-powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
-
-# WinFsp 導入環境での実仮想ドライブ + RAM ディスク E2E 検証
-powershell -ExecutionPolicy Bypass -File .\scripts\run-winfsp-e2e.ps1
-```
-
-仮想ドライブマウント機能および内蔵 RAM ディスク機能を利用する場合は、WinFsp ランタイムを導入してください:
-
-```powershell
-winget install WinFsp.WinFsp
-```
-
-（または `HCX.App` 画面内の「WinFsp をインストール (winget)」ボタンからも導入できます）
+- **生ディスク／生ボリューム書き込み禁止**: `CacheOptions.Validate()`・`AppSettingsManager.Sanitize()`・`InMemoryVolumeStore`・`HCX.Mcp` の全入口で `\\?\` / `\\.\` の生デバイスパスを拒否。
+- **Named Pipe ユーザー分離 ACL**: `HcxControlPipeServer` は `WindowsIdentity.GetCurrent().User` のみに `FullControl` を付与し、他ユーザープロセスからの操作を遮断。
+- **パストラバーサル & リンク越境 & 再帰キャッシュ防止**: 字句境界検証、`..`・NUL バイト・`.hcx` / `.hcx_bench_*` の遮断、ジャンクション／シンボリックリンクの解決先ルート境界チェック、Reparse Point スキップを徹底。
+- **最小権限 & 依存パッケージ監査**: `asInvoker` マニフェスト。全 5 プロジェクトで NuGet 既知脆弱性 **0 件**。
 
 ---
 
 ## MCP サーバー対応（Antigravity / Claude Code）
 
-HyperCache X には、外部 NuGet 依存ゼロの **MCP (Model Context Protocol) JSON-RPC 2.0 over stdio サーバー**（[`src/HCX.Mcp`](src/HCX.Mcp/HCX.Mcp.csproj) / `HCX.Mcp.exe`）が同梱されています。
+外部 NuGet 依存ゼロの **MCP JSON-RPC 2.0 over stdio サーバー**（[`src/HCX.Mcp`](src/HCX.Mcp/HCX.Mcp.csproj) / `HCX.Mcp.exe`）を同梱しています。
 
-### 提供ツール一覧（8 ツール）
+### 提供ツール一覧（12 ツール）
 
 | ツール名 | 機能 |
 |---|---|
+| `hcx_live_app_status` | 稼働中 `HCX.App` 本体のライブ統計・Top 10 ホットファイル・RAMDisk 状態を取得（Named Pipe IPC） |
+| `hcx_live_app_sync` | 稼働中 `HCX.App` 本体の全 Dirty ブロックを即時 `SyncAll()` |
+| `hcx_warm_path` | 指定フォルダ／ファイルを事前ウォームアップ＆ピン留め（`HCX.App` 本体／MCP セッション両対応） |
+| `hcx_get_hot_files` | ホットファイル Top 10（ヒット数・ミス数・ヒット率）を取得 |
 | `hcx_get_system_info` | 物理ドライブ、検出 RAMDisk、空きドライブレター、WinFsp 導入状態、設定パスを取得 |
-| `hcx_get_settings` | サニタイズ済みの `settings.json`（保存プロファイル・同期間隔等）を取得 |
-| `hcx_run_benchmark` | 指定フォルダで 3 階層キャッシュ実測ベンチマークを実行し、MB/s・ヒット率・整合性を返却 |
-| `hcx_start_session` | MCP 内で `HybridCacheEngine` セッションを起動（生デバイスパス拒否・最大 8 セッション） |
-| `hcx_get_session_stats` | 稼働セッションのヒット率・L1/L2 ブロック数・先読み数・Dirty 数を取得 |
-| `hcx_sync_session` | Write-Back の Dirty ブロックを `SyncAll()` で即時フラッシュ |
-| `hcx_stop_session` | セッションを安全停止（同期・L1→L2 退避・メタデータ保存） |
+| `hcx_get_settings` | サニタイズ済みの `settings.json` を取得 |
+| `hcx_run_benchmark` | 3 階層キャッシュ実測ベンチマークを実行し、MB/s・ヒット率・整合性を返却 |
+| `hcx_start_session` | MCP 内で独立した `HybridCacheEngine` セッションを起動（最大 8 セッション） |
+| `hcx_get_session_stats` | MCP セッションの `CacheStatsSnapshot` を取得 |
+| `hcx_sync_session` | MCP セッションの Dirty ブロックを即時フラッシュ |
+| `hcx_stop_session` | MCP セッションを安全停止 |
 | `hcx_cleanup_cache` | キャッシュフォルダの孤立ファイル（`cache_*.bin`, `l1_cache_*.bin` 等）を安全削除 |
 
 ### Claude Code での接続方法
 
-リポジトリ直下に [`.mcp.json`](.mcp.json) を配置済みのため、Claude Code でプロジェクトを開くだけで `hypercache-x` サーバーが自動認識されます。CLI からユーザー設定へ登録する場合は以下を実行してください（ビルド済み exe を使うと起動が高速です）：
+リポジトリ直下に [`.mcp.json`](.mcp.json) を配置済みのため、Claude Code でプロジェクトを開くだけで `hypercache-x` が自動認識されます。グローバル登録する場合：
 
 ```powershell
-# ビルド済み HCX.Mcp.exe を登録（推奨・高速）
 claude mcp add hypercache-x -- "E:\HCX\src\HCX.Mcp\bin\Release\net10.0-windows\HCX.Mcp.exe"
-
-# または dotnet run 経由で登録
-claude mcp add hypercache-x -- dotnet run --project "E:\HCX\src\HCX.Mcp\HCX.Mcp.csproj" -c Release
 ```
 
 ### Antigravity での接続方法
 
-Antigravity の MCP 設定ファイル（`%USERPROFILE%\.gemini\antigravity\mcp_config.json`）の `mcpServers` に以下を追記してください：
+`%USERPROFILE%\.gemini\antigravity\mcp_config.json` の `mcpServers` に追加してください：
 
 ```json
 {
@@ -128,4 +80,28 @@ Antigravity の MCP 設定ファイル（`%USERPROFILE%\.gemini\antigravity\mcp_
 }
 ```
 
-（リリース ZIP 展開先を使う場合は `command` を展開先の `HCX.Mcp.exe` のパスへ置き換えてください）
+---
+
+## プロジェクト構成 & 検証結果 (v2.4.0)
+
+- [`src/HCX.Core`](src/HCX.Core/HCX.Core.csproj): 3 階層シャード化キャッシュエンジン・フィルタ・IPC (`HybridCacheEngine`, `CacheFilterRules`, `HcxControlPipeServer`, `RamCacheTier`, `RamDiskFileCacheTier`, `SsdFileCacheTier`, `AiAccessScorer`, `MetadataManager`, `AppSettingsManager`)
+- [`src/HCX.VirtualFs`](src/HCX.VirtualFs/HCX.VirtualFs.csproj): WinFsp 仮想 FS・永続化対応内蔵 RAM ディスク (`HcxFileSystem`, `InMemoryVolumeStore`, `MemoryFileSystem`, `RamDiskHost`, `WinFspRuntime`)
+- [`src/HCX.App`](src/HCX.App/HCX.App.csproj): ダークモード WPF ダッシュボード（32×8 ヒートマップ、60 秒スパークライン、ホットファイル Top 10、事前ウォームアップ、永続 RAMDisk、バッテリー保護、ライブ MCP IPC）
+- [`src/HCX.Mcp`](src/HCX.Mcp/HCX.Mcp.csproj): 外部依存ゼロの MCP stdio サーバー（12 ツール）
+- [`tests/HCX.Tests`](tests/HCX.Tests/HCX.Tests.csproj): xUnit 自動テストスイート（**65 件**）
+
+### ビルド・テスト・配布コマンド
+
+```powershell
+dotnet restore HCX.sln
+dotnet build HCX.sln -c Release --no-restore
+dotnet test HCX.sln -c Release --no-build
+
+# 配布 ZIP 2種 (HCX.App.exe + HCX.Mcp.exe 同梱) + SHA256SUMS.txt の生成
+powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+
+# WinFsp 導入環境での実仮想ドライブ + RAM ディスク E2E 検証
+powershell -ExecutionPolicy Bypass -File .\scripts\run-winfsp-e2e.ps1
+```
+
+仮想ドライブマウント機能および内蔵 RAM ディスク機能を利用する場合は WinFsp を導入してください: `winget install WinFsp.WinFsp`

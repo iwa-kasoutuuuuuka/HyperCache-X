@@ -172,6 +172,34 @@ public sealed class CacheStatsSnapshot
 	public string L1BackendSummary { get; init; } = string.Empty;
 
 	public WritePolicy WritePolicy { get; init; }
+
+	public WorkloadPreset WorkloadPreset { get; init; }
+
+	public HotFileStat[] TopHotFiles { get; init; } = Array.Empty<HotFileStat>();
+}
+
+public sealed class HotFileStat
+{
+	public string RelativePath { get; init; } = string.Empty;
+
+	public long Hits { get; init; }
+
+	public long Misses { get; init; }
+
+	public long TotalBytes { get; init; }
+
+	public double HitRatePercent => (Hits + Misses) == 0 ? 0.0 : (double)Hits * 100.0 / (Hits + Misses);
+}
+
+public sealed class WarmResult
+{
+	public int FilesWarmed { get; init; }
+
+	public int BlocksWarmed { get; init; }
+
+	public long BytesWarmed { get; init; }
+
+	public bool Pinned { get; init; }
 }
 
 /// <summary>

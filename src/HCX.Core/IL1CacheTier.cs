@@ -31,7 +31,8 @@ public interface IL1CacheTier : IDisposable
 		long backingSize,
 		long backingTicks,
 		double aiScore,
-		Action<BlockKey, byte[], int>? onEvictDirty = null);
+		Action<BlockKey, byte[], int>? onEvictDirty = null,
+		Action<RamBlockCopy>? onEvictClean = null);
 
 	bool TryPatchOrGetForWrite(
 		BlockKey key,

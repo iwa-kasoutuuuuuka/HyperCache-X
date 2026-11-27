@@ -25,6 +25,8 @@ public partial class MainWindow : Window
 	{
 		public required HybridCacheEngine Engine { get; init; }
 		public VirtualDriveHost? VirtualDrive { get; set; }
+		public required SessionProfile Profile { get; init; }
+		public long InProcessRamBytes { get; init; }
 		public string DisplayLabel { get; init; } = string.Empty;
 
 		public void Dispose()
@@ -88,7 +90,7 @@ public partial class MainWindow : Window
 			Hide();
 		}
 
-		Log("HyperCache X v2.1.1 起動中 (ディスク情報を非同期読み込みしています)...");
+		Log("HyperCache X v2.2.0 起動中 (ディスク情報を非同期読み込みしています)...");
 		Dispatcher.BeginInvoke(() => _ = InitializeAsync(), DispatcherPriority.Loaded);
 	}
 
@@ -106,7 +108,7 @@ public partial class MainWindow : Window
 		await RefreshDisksAndOptionsAsync();
 
 		ApplySavedSettingsToUi(_settings);
-		Log("HyperCache X v2.1.1 準備完了 (既存RAMDisk優先 L1 + 永続L2 SSD + 内蔵RAMディスク)。");
+		Log("HyperCache X v2.2.0 準備完了 (既存RAMDisk優先 L1 + 永続L2 SSD + 内蔵RAMディスク)。");
 
 		DiskInfo? preferredRam = DiskUtility.FindPreferredRamDisk(_cachedDisks);
 		if (preferredRam != null)
@@ -114,10 +116,45 @@ public partial class MainWindow : Window
 			Log($"既存 RAMDisk を検出しました: {preferredRam.DisplayName} (L1 キャッシュで優先使用します)");
 		}
 
-		if (_settings.AutoRestoreSession && !string.IsNullOrWhiteSpace(_settings.TargetPath) && Directory.Exists(_settings.TargetPath))
+		if (_settings.AutoRestoreSession)
 		{
-			Log("前回セッションの設定を自動復元してエンジンを起動します...");
-			StartEngineFromUi();
+			if (_settings.SavedRamDisks.Count > 0 && WinFspRuntime.GetStatus().State == WinFspInstallState.Installed)
+			{
+				bool mountedAnyRamDisk = false;
+				foreach (RamDiskProfile rp in _settings.SavedRamDisks)
+				{
+					if (!string.IsNullOrWhiteSpace(rp.MountPoint) && Directory.Exists(rp.MountPoint + "\\"))
+					{
+						continue;
+					}
+					if (!string.IsNullOrWhiteSpace(rp.MountPoint) &&
+					    CreateAndMountRamDisk(rp.MountPoint, rp.CapacityMb, rp.VolumeLabel, isAutoRestore: true))
+					{
+						mountedAnyRamDisk = true;
+					}
+				}
+				if (mountedAnyRamDisk)
+				{
+					await RefreshDisksAndOptionsAsync();
+				}
+			}
+
+			if (_settings.SavedSessions.Count > 0)
+			{
+				Log($"前回の構成を自動復元します ({_settings.SavedSessions.Count} セッション)...");
+				foreach (SessionProfile sp in _settings.SavedSessions)
+				{
+					if (!string.IsNullOrWhiteSpace(sp.TargetPath) && Directory.Exists(sp.TargetPath))
+					{
+						StartEngineFromUi(profileOverride: sp, isAutoRestore: true);
+					}
+				}
+			}
+			else if (!string.IsNullOrWhiteSpace(_settings.TargetPath) && Directory.Exists(_settings.TargetPath))
+			{
+				Log("前回セッションの設定を自動復元してエンジンを起動します...");
+				StartEngineFromUi(isAutoRestore: true);
+			}
 		}
 	}
 
@@ -166,7 +203,7 @@ public partial class MainWindow : Window
 
 		_notifyIcon.ContextMenuStrip = _trayMenu;
 		_notifyIcon.Visible = true;
-		_notifyIcon.Text = "HyperCache X v2.1 - 準備完了";
+		_notifyIcon.Text = "HyperCache X v2.2.0 - 準備完了";
 		_notifyIcon.DoubleClick += (_, _) => ShowWindow();
 		RefreshTrayMenu();
 	}
@@ -203,6 +240,11 @@ public partial class MainWindow : Window
 		{
 			Hide();
 		}
+	}
+
+	public void RestoreFromTray()
+	{
+		ShowWindow();
 	}
 
 	private void ShowWindow()
@@ -380,6 +422,8 @@ public partial class MainWindow : Window
 
 		SelectComboItemByTag(SsdSizeCombo, settings.SsdSizeMb.ToString());
 		SelectComboItemByTag(WritePolicyCombo, settings.WritePolicy);
+		SelectComboItemByTag(FlushIntervalCombo, settings.FlushIntervalSeconds.ToString());
+		FlushIntervalCombo.IsEnabled = !string.Equals(settings.WritePolicy, nameof(WritePolicy.WriteThrough), StringComparison.OrdinalIgnoreCase);
 
 		if (settings.PerformanceModeIndex >= 0 && settings.PerformanceModeIndex < PerformanceMode.Items.Count)
 		{
@@ -402,9 +446,9 @@ public partial class MainWindow : Window
 		}
 	}
 
-	private void SaveCurrentSettings()
+	private SessionProfile BuildCurrentSessionProfileFromUi()
 	{
-		AppSettings current = new AppSettings
+		return new SessionProfile
 		{
 			TargetPath = _customTargetFolder ?? (DiskList.SelectedItem as DiskInfo)?.RootPath,
 			L1BackendMode = (L1BackendCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "AutoPreferRamDisk",
@@ -415,11 +459,40 @@ public partial class MainWindow : Window
 			WritePolicy = (WritePolicyCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "WriteBack",
 			MountPoint = MountPointCombo.SelectedItem as string,
 			PerformanceModeIndex = PerformanceMode.SelectedIndex,
+			FlushIntervalSeconds = (int)GetSelectedTagLong(FlushIntervalCombo, 10)
+		};
+	}
+
+	private void SaveCurrentSettings()
+	{
+		SessionProfile uiProfile = BuildCurrentSessionProfileFromUi();
+		AppSettings current = new AppSettings
+		{
+			TargetPath = uiProfile.TargetPath,
+			L1BackendMode = uiProfile.L1BackendMode,
+			RamSizeMb = uiProfile.RamSizeMb,
+			PreferredRamDiskRoot = uiProfile.PreferredRamDiskRoot,
+			SsdRoot = uiProfile.SsdRoot,
+			SsdSizeMb = uiProfile.SsdSizeMb,
+			WritePolicy = uiProfile.WritePolicy,
+			MountPoint = uiProfile.MountPoint,
+			PerformanceModeIndex = uiProfile.PerformanceModeIndex,
+			FlushIntervalSeconds = uiProfile.FlushIntervalSeconds,
 			RamDiskMountPoint = RamDiskMountCombo.SelectedItem as string,
 			RamDiskCapacityMb = GetSelectedTagLong(RamDiskCapacityCombo, 2048),
 			RamDiskLabel = string.IsNullOrWhiteSpace(TxtRamDiskLabel.Text) ? "HCX_RAMDISK" : TxtRamDiskLabel.Text.Trim(),
 			AutoStartWithWindows = ChkAutoStartWindows.IsChecked == true,
-			AutoRestoreSession = ChkAutoRestore.IsChecked == true
+			AutoRestoreSession = ChkAutoRestore.IsChecked == true,
+			SavedSessions = _sessions.Select(s => s.Profile).ToList(),
+			SavedRamDisks = _ramDiskHosts
+				.Where(h => !string.IsNullOrWhiteSpace(h.MountedPoint))
+				.Select(h => new RamDiskProfile
+				{
+					MountPoint = h.MountedPoint,
+					CapacityMb = h.CapacityBytes / (1024L * 1024L),
+					VolumeLabel = h.VolumeLabel
+				})
+				.ToList()
 		};
 		_settings = current;
 		AppSettingsManager.Save(current);
@@ -476,6 +549,16 @@ public partial class MainWindow : Window
 		string modeTag = (L1BackendCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "AutoPreferRamDisk";
 		L1RamDiskCombo.IsEnabled = modeTag is "AutoPreferRamDisk" or "RamDiskFile";
 		RamSizeCombo.IsEnabled = modeTag != "Disabled";
+	}
+
+	private void WritePolicyCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+	{
+		if (FlushIntervalCombo == null || WritePolicyCombo == null)
+		{
+			return;
+		}
+		string policyTag = (WritePolicyCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "WriteBack";
+		FlushIntervalCombo.IsEnabled = !string.Equals(policyTag, "WriteThrough", StringComparison.OrdinalIgnoreCase);
 	}
 
 	private void BtnBrowseTarget_Click(object sender, RoutedEventArgs e)
@@ -545,31 +628,41 @@ public partial class MainWindow : Window
 		StartEngineFromUi();
 	}
 
-	private void StartEngineFromUi()
+	private void StartEngineFromUi(SessionProfile? profileOverride = null, bool isAutoRestore = false)
 	{
 		try
 		{
-			string? targetPath = _customTargetFolder ?? (DiskList.SelectedItem as DiskInfo)?.RootPath;
+			SessionProfile profile = profileOverride ?? BuildCurrentSessionProfileFromUi();
+			string? targetPath = profile.TargetPath;
 			if (string.IsNullOrWhiteSpace(targetPath) || !Directory.Exists(targetPath))
 			{
-				System.Windows.MessageBox.Show("有効な加速ターゲット (HDD またはフォルダ) を選択してください。");
+				if (!isAutoRestore)
+				{
+					System.Windows.MessageBox.Show("有効な加速ターゲット (HDD またはフォルダ) を選択してください。");
+				}
 				return;
 			}
 			string normalizedTarget = Path.GetFullPath(targetPath).TrimEnd('\\');
 			if (Path.GetFileName(normalizedTarget).Equals(".hcx", StringComparison.OrdinalIgnoreCase) ||
 			    normalizedTarget.Contains(@"\.hcx\", StringComparison.OrdinalIgnoreCase))
 			{
-				System.Windows.MessageBox.Show("内部キャッシュ用フォルダ (.hcx) を加速ターゲットに指定することはできません。");
+				if (!isAutoRestore)
+				{
+					System.Windows.MessageBox.Show("内部キャッシュ用フォルダ (.hcx) を加速ターゲットに指定することはできません。");
+				}
 				return;
 			}
 
 			if (_sessions.Any(s => string.Equals(Path.GetFullPath(s.Engine.TargetRootPath), Path.GetFullPath(targetPath), StringComparison.OrdinalIgnoreCase)))
 			{
-				System.Windows.MessageBox.Show("このターゲットは既に稼働中です。");
+				if (!isAutoRestore)
+				{
+					System.Windows.MessageBox.Show("このターゲットは既に稼働中です。");
+				}
 				return;
 			}
 
-			string l1Tag = (L1BackendCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "AutoPreferRamDisk";
+			string l1Tag = profile.L1BackendMode;
 			L1BackendMode l1Mode = l1Tag switch
 			{
 				"RamDiskFile" => L1BackendMode.RamDiskFile,
@@ -578,62 +671,108 @@ public partial class MainWindow : Window
 				_ => L1BackendMode.AutoPreferRamDisk
 			};
 
-			long l1Mb = l1Mode == L1BackendMode.Disabled ? 0 : GetSelectedTagLong(RamSizeCombo, 1024);
-			long l2Mb = GetSelectedTagLong(SsdSizeCombo, 2048);
+			long l1Mb = l1Mode == L1BackendMode.Disabled ? 0 : profile.RamSizeMb;
+			long l2Mb = profile.SsdSizeMb;
 			if (l1Mb == 0 && l2Mb == 0)
 			{
-				System.Windows.MessageBox.Show("L1 と L2 の両方を OFF にすることはできません。どちらか一方を有効にしてください。");
+				if (!isAutoRestore)
+				{
+					System.Windows.MessageBox.Show("L1 と L2 の両方を OFF にすることはできません。どちらか一方を有効にしてください。");
+				}
 				return;
 			}
 
 			string? ramDiskDir = null;
 			if (l1Mode == L1BackendMode.AutoPreferRamDisk || l1Mode == L1BackendMode.RamDiskFile)
 			{
-				if (L1RamDiskCombo.SelectedItem is DiskInfo selectedRamDisk)
+				if (!string.IsNullOrWhiteSpace(profile.PreferredRamDiskRoot) && Directory.Exists(profile.PreferredRamDiskRoot))
+				{
+					ramDiskDir = Path.Combine(profile.PreferredRamDiskRoot, ".hcx");
+				}
+				else if (L1RamDiskCombo.SelectedItem is DiskInfo selectedRamDisk)
 				{
 					ramDiskDir = Path.Combine(selectedRamDisk.RootPath, ".hcx");
 				}
 				else if (l1Mode == L1BackendMode.RamDiskFile)
 				{
-					System.Windows.MessageBox.Show("「RAMDisk ファイルのみ」が選択されていますが、利用可能な RAMDisk が見つかりません。");
+					if (!isAutoRestore)
+					{
+						System.Windows.MessageBox.Show("「RAMDisk ファイルのみ」が選択されていますが、利用可能な RAMDisk が見つかりません。");
+					}
 					return;
+				}
+			}
+
+			long totalRam = DiskUtility.GetTotalPhysicalMemoryBytes();
+			bool willUseInProcessRam = l1Mb > 0 && (l1Mode == L1BackendMode.InProcessRam || (l1Mode == L1BackendMode.AutoPreferRamDisk && ramDiskDir == null));
+			long plannedInProcessBytes = willUseInProcessRam ? l1Mb * 1024L * 1024L : 0L;
+			long cumulativeInProcessBytes = _sessions.Sum(s => s.InProcessRamBytes) + plannedInProcessBytes;
+			if (willUseInProcessRam && cumulativeInProcessBytes > totalRam / 2)
+			{
+				if (!isAutoRestore)
+				{
+					MessageBoxResult ramWarn = System.Windows.MessageBox.Show(
+						$"プロセス内 L1 RAM キャッシュ合計 ({cumulativeInProcessBytes / (1024.0 * 1024.0 * 1024.0):F1} GB) が物理メモリ総量の半分を超えています。\n続行しますか？",
+						"L1 RAM 容量の確認",
+						MessageBoxButton.YesNo,
+						MessageBoxImage.Warning);
+					if (ramWarn != MessageBoxResult.Yes)
+					{
+						return;
+					}
+				}
+				else
+				{
+					Log($"[警告] プロセス内 L1 RAM 合計 ({cumulativeInProcessBytes / (1024 * 1024)} MB) が搭載 RAM の半分を超えています。");
 				}
 			}
 
 			string ssdDir = string.Empty;
 			if (l2Mb > 0)
 			{
-				if (SsdList.SelectedItem is not DiskInfo ssdDisk)
+				string? ssdRoot = profile.SsdRoot;
+				if (string.IsNullOrWhiteSpace(ssdRoot) && SsdList.SelectedItem is DiskInfo ssdDisk)
 				{
-					System.Windows.MessageBox.Show("L2 キャッシュ先の SSD を選択してください。");
+					ssdRoot = ssdDisk.RootPath;
+				}
+				if (string.IsNullOrWhiteSpace(ssdRoot) || !Directory.Exists(ssdRoot))
+				{
+					if (!isAutoRestore)
+					{
+						System.Windows.MessageBox.Show("L2 キャッシュ先の SSD を選択してください。");
+					}
 					return;
 				}
-				ssdDir = Path.Combine(ssdDisk.RootPath, ".hcx");
+				ssdDir = Path.Combine(ssdRoot, ".hcx");
 			}
 
-			string selectedMount = MountPointCombo.SelectedItem as string ?? string.Empty;
+			string selectedMount = profile.MountPoint ?? string.Empty;
 			bool shouldMount = selectedMount.Length == 2 && selectedMount[1] == ':';
 			if (shouldMount && WinFspRuntime.GetStatus().State != WinFspInstallState.Installed)
 			{
-				System.Windows.MessageBox.Show(
-					"仮想ドライブのマウントには WinFsp が必要です。\n[WinFsp をインストール] を行うか、「マウントなし (直接検証モード)」を選択してください。",
-					"WinFsp 未インストール",
-					MessageBoxButton.OK,
-					MessageBoxImage.Warning);
+				if (!isAutoRestore)
+				{
+					System.Windows.MessageBox.Show(
+						"仮想ドライブのマウントには WinFsp が必要です。\n[WinFsp をインストール] を行うか、「マウントなし (直接検証モード)」を選択してください。",
+						"WinFsp 未インストール",
+						MessageBoxButton.OK,
+						MessageBoxImage.Warning);
+				}
 				return;
 			}
 
-			WritePolicy policy = (WritePolicyCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() == "WriteThrough"
+			WritePolicy policy = string.Equals(profile.WritePolicy, "WriteThrough", StringComparison.OrdinalIgnoreCase)
 				? WritePolicy.WriteThrough
 				: WritePolicy.WriteBack;
 
-			(TimeSpan aiInterval, double ssdThresh, double ramThresh) = PerformanceMode.SelectedIndex switch
+			(TimeSpan aiInterval, double ssdThresh, double ramThresh) = profile.PerformanceModeIndex switch
 			{
 				0 => (TimeSpan.FromSeconds(10), 2.5, 4.0),
 				2 => (TimeSpan.FromSeconds(1), 1.0, 1.5),
 				_ => (TimeSpan.FromSeconds(3), 1.2, 2.0)
 			};
 
+			int flushSeconds = Math.Clamp(profile.FlushIntervalSeconds, 1, 300);
 			CacheOptions options = new CacheOptions
 			{
 				TargetRootPath = targetPath,
@@ -644,6 +783,7 @@ public partial class MainWindow : Window
 				RamCacheSizeBytes = l1Mb * 1024L * 1024L,
 				SsdCacheSizeBytes = l2Mb * 1024L * 1024L,
 				WritePolicy = policy,
+				FlushInterval = TimeSpan.FromSeconds(flushSeconds),
 				AiInterval = aiInterval,
 				SsdPromoteScore = ssdThresh,
 				RamPromoteScore = ramThresh
@@ -670,12 +810,21 @@ public partial class MainWindow : Window
 				{
 					driveHost?.Dispose();
 					engine.Dispose();
-					System.Windows.MessageBox.Show($"仮想ドライブのマウントに失敗しました: {mountEx.Message}");
+					if (!isAutoRestore)
+					{
+						System.Windows.MessageBox.Show($"仮想ドライブのマウントに失敗しました: {mountEx.Message}");
+					}
+					else
+					{
+						Log($"[警告] 自動マウント失敗 ({selectedMount}): {mountEx.Message}");
+					}
 					return;
 				}
 			}
 
-			string l1TagShort = engine.GetStatsSnapshot().L1BackendSummary.StartsWith("RAMDisk", StringComparison.Ordinal)
+			string l1Summary = engine.GetStatsSnapshot().L1BackendSummary;
+			bool actualInProcess = l1Summary.StartsWith("In-Process RAM", StringComparison.Ordinal);
+			string l1TagShort = l1Summary.StartsWith("RAMDisk", StringComparison.Ordinal)
 				? "RAMDisk"
 				: (l1Mb > 0 ? "RAM" : "OFF");
 			string label = shouldMount
@@ -686,6 +835,8 @@ public partial class MainWindow : Window
 			{
 				Engine = engine,
 				VirtualDrive = driveHost,
+				Profile = profile,
+				InProcessRamBytes = actualInProcess ? l1Mb * 1024L * 1024L : 0L,
 				DisplayLabel = label
 			});
 
@@ -696,7 +847,10 @@ public partial class MainWindow : Window
 			TxtStatusLabel.Text = "オンライン";
 			TxtStatusLabel.Foreground = System.Windows.Media.Brushes.LimeGreen;
 
-			SaveCurrentSettings();
+			if (!isAutoRestore)
+			{
+				SaveCurrentSettings();
+			}
 			EnsureTimerRunning();
 			UpdateStats();
 			RefreshMountPointOptions();
@@ -704,7 +858,14 @@ public partial class MainWindow : Window
 		}
 		catch (Exception ex)
 		{
-			System.Windows.MessageBox.Show($"起動エラー: {ex.Message}");
+			if (!isAutoRestore)
+			{
+				System.Windows.MessageBox.Show($"起動エラー: {ex.Message}");
+			}
+			else
+			{
+				Log($"[警告] 自動復元起動エラー: {ex.Message}");
+			}
 		}
 	}
 
@@ -762,29 +923,46 @@ public partial class MainWindow : Window
 
 	private async void BtnCreateRamDisk_Click(object sender, RoutedEventArgs e)
 	{
+		if (WinFspRuntime.GetStatus().State != WinFspInstallState.Installed)
+		{
+			System.Windows.MessageBox.Show(
+				"内蔵 RAMディスクのマウントには WinFsp が必要です。\n「ハイブリッド加速」タブの [WinFsp をインストール] から導入してください。",
+				"WinFsp 未インストール",
+				MessageBoxButton.OK,
+				MessageBoxImage.Warning);
+			return;
+		}
+
+		string? mountPoint = RamDiskMountCombo.SelectedItem as string;
+		if (string.IsNullOrWhiteSpace(mountPoint) || mountPoint.Length != 2 || mountPoint[1] != ':')
+		{
+			System.Windows.MessageBox.Show("利用可能なドライブ文字がありません。");
+			return;
+		}
+
+		long capMb = GetSelectedTagLong(RamDiskCapacityCombo, 2048);
+		string label = string.IsNullOrWhiteSpace(TxtRamDiskLabel.Text) ? "HCX_RAMDISK" : TxtRamDiskLabel.Text.Trim();
+		if (CreateAndMountRamDisk(mountPoint, capMb, label, isAutoRestore: false))
+		{
+			SaveCurrentSettings();
+			EnsureTimerRunning();
+			await RefreshDisksAndOptionsAsync();
+			UpdateStats();
+			RefreshTrayMenu();
+		}
+	}
+
+	private bool CreateAndMountRamDisk(string mountPoint, long capMb, string label, bool isAutoRestore)
+	{
 		try
 		{
 			if (WinFspRuntime.GetStatus().State != WinFspInstallState.Installed)
 			{
-				System.Windows.MessageBox.Show(
-					"内蔵 RAMディスクのマウントには WinFsp が必要です。\n「ハイブリッド加速」タブの [WinFsp をインストール] から導入してください。",
-					"WinFsp 未インストール",
-					MessageBoxButton.OK,
-					MessageBoxImage.Warning);
-				return;
+				return false;
 			}
-
-			string? mountPoint = RamDiskMountCombo.SelectedItem as string;
-			if (string.IsNullOrWhiteSpace(mountPoint) || mountPoint.Length != 2 || mountPoint[1] != ':')
-			{
-				System.Windows.MessageBox.Show("利用可能なドライブ文字がありません。");
-				return;
-			}
-
-			long capMb = GetSelectedTagLong(RamDiskCapacityCombo, 2048);
 			long capBytes = capMb * 1024L * 1024L;
 			long totalRam = DiskUtility.GetTotalPhysicalMemoryBytes();
-			if (capBytes > totalRam / 2)
+			if (capBytes > totalRam / 2 && !isAutoRestore)
 			{
 				MessageBoxResult warn = System.Windows.MessageBox.Show(
 					$"指定容量 ({capMb / 1024.0:F1} GB) が物理メモリ総量の半分を超えています。続行しますか？",
@@ -793,26 +971,29 @@ public partial class MainWindow : Window
 					MessageBoxImage.Warning);
 				if (warn != MessageBoxResult.Yes)
 				{
-					return;
+					return false;
 				}
 			}
 
-			string label = string.IsNullOrWhiteSpace(TxtRamDiskLabel.Text) ? "HCX_RAMDISK" : TxtRamDiskLabel.Text.Trim();
 			RamDiskHost host = new RamDiskHost(capBytes, label);
 			host.Mount(mountPoint);
 			_ramDiskHosts.Add(host);
 
 			BtnUnmountAllRamDisks.IsEnabled = true;
 			Log($"内蔵 RAMディスクを作成・マウントしました: {mountPoint}\\ ({capMb} MB, Label={label})");
-
-			EnsureTimerRunning();
-			await RefreshDisksAndOptionsAsync();
-			UpdateStats();
-			RefreshTrayMenu();
+			return true;
 		}
 		catch (Exception ex)
 		{
-			System.Windows.MessageBox.Show($"RAMディスク作成エラー: {ex.Message}");
+			if (!isAutoRestore)
+			{
+				System.Windows.MessageBox.Show($"RAMディスク作成エラー: {ex.Message}");
+			}
+			else
+			{
+				Log($"[警告] 内蔵 RAMディスクの自動復元に失敗 ({mountPoint}): {ex.Message}");
+			}
+			return false;
 		}
 	}
 
@@ -945,7 +1126,7 @@ public partial class MainWindow : Window
 
 		if (_notifyIcon != null)
 		{
-			_notifyIcon.Text = $"HCX v2.1 - {_sessions.Count}件稼働 (Hit: {hitRate:F1}%)";
+			_notifyIcon.Text = $"HCX v2.2.0 - {_sessions.Count}件稼働 (Hit: {hitRate:F1}%)";
 		}
 		RefreshTrayMenu();
 	}
@@ -1027,6 +1208,7 @@ public partial class MainWindow : Window
 	private void BtnStop_Click(object sender, RoutedEventArgs e)
 	{
 		StopAllSessions();
+		SaveCurrentSettings();
 		UpdateStats();
 		RefreshMountPointOptions();
 		RefreshTrayMenu();
@@ -1057,7 +1239,7 @@ public partial class MainWindow : Window
 		}
 		if (_notifyIcon != null)
 		{
-			_notifyIcon.Text = "HyperCache X v2.1.1 - 準備完了";
+			_notifyIcon.Text = "HyperCache X v2.2.0 - 準備完了";
 		}
 		Log("すべての仮想ドライブを安全にアンマウントし、HDD 同期を完了しました。");
 	}

@@ -94,7 +94,13 @@ public sealed class StabilityAndReliabilityTests : IDisposable
 						{
 							string diskPath = Path.Combine(_targetDir, rel);
 							long diskLen = File.Exists(diskPath) ? new FileInfo(diskPath).Length : -1;
-							byte diskB0 = File.Exists(diskPath) && diskLen > 0 ? File.ReadAllBytes(diskPath)[0] : (byte)0;
+							byte diskB0 = 0;
+							if (File.Exists(diskPath) && diskLen > 0)
+							{
+								using FileStream diagFs = new FileStream(diskPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+								int b = diagFs.ReadByte();
+								if (b >= 0) diskB0 = (byte)b;
+							}
 							Assert.Fail($"Mismatch file={rel} iter={iter} writeOffset={offset} got={got} byteIdx={bi} expected={expected[f][bi]:X2} actual={readBuf[bi]:X2} diskLen={diskLen} diskB0={diskB0:X2} stats={engine.GetStatsSnapshot().DirtyBlocks}");
 						}
 					}
@@ -418,5 +424,36 @@ public sealed class StabilityAndReliabilityTests : IDisposable
 		Assert.True(File.Exists(renamed));
 		File.Delete(renamed);
 		Assert.False(File.Exists(renamed));
+	}
+
+	[Fact]
+	public void WinFsp_LiveRamDisk_E2E_WhenInstalled()
+	{
+		WinFspStatusInfo status = WinFspRuntime.GetStatus();
+		if (status.State != WinFspInstallState.Installed)
+		{
+			Assert.Equal(WinFspInstallState.NotInstalled, status.State);
+			return;
+		}
+
+		string? freeLetter = DiskUtility.GetAvailableDriveLetters().LastOrDefault();
+		if (string.IsNullOrEmpty(freeLetter))
+		{
+			return;
+		}
+
+		using RamDiskHost host = new RamDiskHost(16 * 1024 * 1024, "HCX_RAM_E2E");
+		host.Mount(freeLetter);
+
+		string mountedFile = Path.Combine(freeLetter + "\\", "ram_e2e.bin");
+		byte[] expected = Enumerable.Range(0, 16384).Select(i => (byte)(i & 0xFF)).ToArray();
+		File.WriteAllBytes(mountedFile, expected);
+		Assert.True(File.ReadAllBytes(mountedFile).AsSpan().SequenceEqual(expected));
+		Assert.True(host.Store.GetStats().UsedBytes > 0);
+
+		File.Delete(mountedFile);
+		Assert.False(File.Exists(mountedFile));
+		host.Unmount();
+		Assert.Equal(0, host.Store.GetStats().UsedBytes);
 	}
 }

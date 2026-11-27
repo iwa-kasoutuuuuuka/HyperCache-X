@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -6,6 +7,27 @@ using System.Text.Json;
 using Microsoft.Win32;
 
 namespace HCX.Core;
+
+public sealed class SessionProfile
+{
+	public string? TargetPath { get; set; }
+	public string L1BackendMode { get; set; } = "AutoPreferRamDisk";
+	public long RamSizeMb { get; set; } = 1024;
+	public string? PreferredRamDiskRoot { get; set; }
+	public string? SsdRoot { get; set; }
+	public long SsdSizeMb { get; set; } = 2048;
+	public string WritePolicy { get; set; } = "WriteBack";
+	public string? MountPoint { get; set; }
+	public int PerformanceModeIndex { get; set; } = 1;
+	public int FlushIntervalSeconds { get; set; } = 10;
+}
+
+public sealed class RamDiskProfile
+{
+	public string? MountPoint { get; set; }
+	public long CapacityMb { get; set; } = 2048;
+	public string VolumeLabel { get; set; } = "HCX_RAMDISK";
+}
 
 public sealed class AppSettings
 {
@@ -18,11 +40,14 @@ public sealed class AppSettings
 	public string WritePolicy { get; set; } = "WriteBack";
 	public string? MountPoint { get; set; }
 	public int PerformanceModeIndex { get; set; } = 1;
+	public int FlushIntervalSeconds { get; set; } = 10;
 	public string? RamDiskMountPoint { get; set; }
 	public long RamDiskCapacityMb { get; set; } = 2048;
 	public string RamDiskLabel { get; set; } = "HCX_RAMDISK";
 	public bool AutoStartWithWindows { get; set; }
 	public bool AutoRestoreSession { get; set; }
+	public List<SessionProfile> SavedSessions { get; set; } = new List<SessionProfile>();
+	public List<RamDiskProfile> SavedRamDisks { get; set; } = new List<RamDiskProfile>();
 }
 
 /// <summary>
@@ -34,6 +59,7 @@ public static class AppSettingsManager
 	private const string RunSubKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
 	private const string RunValueName = "HyperCacheX";
 	private const long MaxCacheSizeMb = 1_048_576; // 1 TB upper clamp
+	private const int MaxProfiles = 16;
 
 	private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
 	{
@@ -89,30 +115,86 @@ public static class AppSettingsManager
 
 	public static AppSettings Sanitize(AppSettings raw)
 	{
-		string l1Mode = Enum.TryParse<L1BackendMode>(raw.L1BackendMode, ignoreCase: true, out L1BackendMode parsedL1)
-			? parsedL1.ToString()
-			: nameof(HCX.Core.L1BackendMode.AutoPreferRamDisk);
+		List<SessionProfile> cleanSessions = new List<SessionProfile>();
+		if (raw.SavedSessions != null)
+		{
+			foreach (SessionProfile sp in raw.SavedSessions)
+			{
+				if (sp == null)
+				{
+					continue;
+				}
+				string? targetPath = SanitizeFsDirectory(sp.TargetPath, forbidInternalHcx: true);
+				if (string.IsNullOrWhiteSpace(targetPath))
+				{
+					continue;
+				}
+				cleanSessions.Add(new SessionProfile
+				{
+					TargetPath = targetPath,
+					L1BackendMode = SanitizeL1Mode(sp.L1BackendMode),
+					RamSizeMb = Math.Clamp(sp.RamSizeMb, 0L, MaxCacheSizeMb),
+					PreferredRamDiskRoot = SanitizeFsDirectory(sp.PreferredRamDiskRoot, forbidInternalHcx: false),
+					SsdRoot = SanitizeFsDirectory(sp.SsdRoot, forbidInternalHcx: false),
+					SsdSizeMb = Math.Clamp(sp.SsdSizeMb, 0L, MaxCacheSizeMb),
+					WritePolicy = SanitizeWritePolicy(sp.WritePolicy),
+					MountPoint = SanitizeMountPoint(sp.MountPoint),
+					PerformanceModeIndex = Math.Clamp(sp.PerformanceModeIndex, 0, 2),
+					FlushIntervalSeconds = Math.Clamp(sp.FlushIntervalSeconds, 1, 300)
+				});
+				if (cleanSessions.Count >= MaxProfiles)
+				{
+					break;
+				}
+			}
+		}
 
-		string writePolicy = Enum.TryParse<WritePolicy>(raw.WritePolicy, ignoreCase: true, out WritePolicy parsedPolicy)
-			? parsedPolicy.ToString()
-			: nameof(HCX.Core.WritePolicy.WriteBack);
+		List<RamDiskProfile> cleanRamDisks = new List<RamDiskProfile>();
+		if (raw.SavedRamDisks != null)
+		{
+			foreach (RamDiskProfile rp in raw.SavedRamDisks)
+			{
+				if (rp == null)
+				{
+					continue;
+				}
+				string? mount = SanitizeMountPoint(rp.MountPoint);
+				if (string.IsNullOrWhiteSpace(mount) || mount.Length != 2 || mount[1] != ':')
+				{
+					continue;
+				}
+				cleanRamDisks.Add(new RamDiskProfile
+				{
+					MountPoint = mount,
+					CapacityMb = Math.Clamp(rp.CapacityMb, 64L, MaxCacheSizeMb),
+					VolumeLabel = SanitizeLabel(rp.VolumeLabel)
+				});
+				if (cleanRamDisks.Count >= MaxProfiles)
+				{
+					break;
+				}
+			}
+		}
 
 		return new AppSettings
 		{
 			TargetPath = SanitizeFsDirectory(raw.TargetPath, forbidInternalHcx: true),
-			L1BackendMode = l1Mode,
+			L1BackendMode = SanitizeL1Mode(raw.L1BackendMode),
 			RamSizeMb = Math.Clamp(raw.RamSizeMb, 0L, MaxCacheSizeMb),
 			PreferredRamDiskRoot = SanitizeFsDirectory(raw.PreferredRamDiskRoot, forbidInternalHcx: false),
 			SsdRoot = SanitizeFsDirectory(raw.SsdRoot, forbidInternalHcx: false),
 			SsdSizeMb = Math.Clamp(raw.SsdSizeMb, 0L, MaxCacheSizeMb),
-			WritePolicy = writePolicy,
+			WritePolicy = SanitizeWritePolicy(raw.WritePolicy),
 			MountPoint = SanitizeMountPoint(raw.MountPoint),
 			PerformanceModeIndex = Math.Clamp(raw.PerformanceModeIndex, 0, 2),
+			FlushIntervalSeconds = Math.Clamp(raw.FlushIntervalSeconds, 1, 300),
 			RamDiskMountPoint = SanitizeMountPoint(raw.RamDiskMountPoint),
 			RamDiskCapacityMb = Math.Clamp(raw.RamDiskCapacityMb, 0L, MaxCacheSizeMb),
 			RamDiskLabel = SanitizeLabel(raw.RamDiskLabel),
 			AutoStartWithWindows = raw.AutoStartWithWindows,
-			AutoRestoreSession = raw.AutoRestoreSession
+			AutoRestoreSession = raw.AutoRestoreSession,
+			SavedSessions = cleanSessions,
+			SavedRamDisks = cleanRamDisks
 		};
 	}
 
@@ -159,6 +241,20 @@ public static class AppSettingsManager
 		{
 			return false;
 		}
+	}
+
+	private static string SanitizeL1Mode(string? mode)
+	{
+		return Enum.TryParse<L1BackendMode>(mode, ignoreCase: true, out L1BackendMode parsed)
+			? parsed.ToString()
+			: nameof(HCX.Core.L1BackendMode.AutoPreferRamDisk);
+	}
+
+	private static string SanitizeWritePolicy(string? policy)
+	{
+		return Enum.TryParse<WritePolicy>(policy, ignoreCase: true, out WritePolicy parsed)
+			? parsed.ToString()
+			: nameof(HCX.Core.WritePolicy.WriteBack);
 	}
 
 	private static bool TryValidateExecutablePath(string path, out string normalizedPath)

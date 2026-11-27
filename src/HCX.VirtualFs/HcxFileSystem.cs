@@ -802,14 +802,68 @@ public sealed class HcxFileSystem : FileSystemBase
 
 		// Protect internal HCX cache directories from self-referential virtual FS recursion.
 		string normalizedRel = combined.Length > rootWithSep.Length ? combined.Substring(rootWithSep.Length) : string.Empty;
-		if (string.Equals(normalizedRel, ".hcx", StringComparison.OrdinalIgnoreCase) ||
-		    normalizedRel.StartsWith(@".hcx\", StringComparison.OrdinalIgnoreCase) ||
-		    normalizedRel.StartsWith(".hcx_bench_", StringComparison.OrdinalIgnoreCase))
+		if (IsInternalHcxRelativePath(normalizedRel))
 		{
 			ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED
 		}
 
+		EnsureNoEscapingReparsePoint(combined, rootWithSep);
 		return combined;
+	}
+
+	private static bool IsInternalHcxRelativePath(string normalizedRel)
+	{
+		return string.Equals(normalizedRel, ".hcx", StringComparison.OrdinalIgnoreCase) ||
+		       normalizedRel.StartsWith(@".hcx\", StringComparison.OrdinalIgnoreCase) ||
+		       normalizedRel.StartsWith(".hcx_bench_", StringComparison.OrdinalIgnoreCase);
+	}
+
+	private void EnsureNoEscapingReparsePoint(string combinedFullPath, string rootWithSep)
+	{
+		if (combinedFullPath.Length <= rootWithSep.Length)
+		{
+			return;
+		}
+
+		string relPart = combinedFullPath.Substring(rootWithSep.Length);
+		string[] segments = relPart.Split('\\', StringSplitOptions.RemoveEmptyEntries);
+		string current = _rootPath;
+
+		foreach (string seg in segments)
+		{
+			current = Path.Combine(current, seg);
+			bool isDir = Directory.Exists(current);
+			bool isFile = !isDir && File.Exists(current);
+			if (!isDir && !isFile)
+			{
+				break;
+			}
+
+			if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+			{
+				FileSystemInfo? target = isDir
+					? Directory.ResolveLinkTarget(current, returnFinalTarget: true)
+					: File.ResolveLinkTarget(current, returnFinalTarget: true);
+				if (target == null)
+				{
+					ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED
+				}
+
+				string resolvedFull = Path.GetFullPath(target!.FullName).TrimEnd('\\');
+				bool insideRoot = string.Equals(resolvedFull, _rootPath, StringComparison.OrdinalIgnoreCase) ||
+				                  resolvedFull.StartsWith(rootWithSep, StringComparison.OrdinalIgnoreCase);
+				if (!insideRoot)
+				{
+					ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED (reparse target escapes root)
+				}
+
+				string resolvedRel = resolvedFull.Length > rootWithSep.Length ? resolvedFull.Substring(rootWithSep.Length) : string.Empty;
+				if (IsInternalHcxRelativePath(resolvedRel))
+				{
+					ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED
+				}
+			}
+		}
 	}
 
 	private string ToRelativePathFromFull(string fullPath)

@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        Title="HyperCache X v2.1 - 3-Tier Hybrid Storage &amp; RAMDisk Engine"
+        Title="HyperCache X v2.2.0 - 3-Tier Hybrid Storage &amp; RAMDisk Engine"
         Height="820"
         Width="1160"
         MinHeight="700"
@@ -111,7 +111,7 @@
           </TextBlock.Effect>
         </TextBlock>
         <Border Background="#4FACFE" Padding="8,3" CornerRadius="4" VerticalAlignment="Bottom" Margin="12,0,0,6">
-          <TextBlock Text="3-TIER HYBRID + RAMDISK v2.1" Foreground="#FF000000" FontSize="10" FontWeight="Bold" />
+          <TextBlock Text="3-TIER HYBRID + RAMDISK v2.2" Foreground="#FF000000" FontSize="10" FontWeight="Bold" />
         </Border>
       </StackPanel>
       <StackPanel HorizontalAlignment="Right" VerticalAlignment="Center" Orientation="Horizontal">
@@ -318,7 +318,7 @@
                       </Grid.ColumnDefinitions>
                       <StackPanel Grid.Column="0" Margin="0,0,5,0">
                         <TextBlock Text="書き込みポリシー" FontSize="10" Margin="0,0,0,4" Foreground="#AAA" />
-                        <ComboBox x:Name="WritePolicyCombo" Height="28" SelectedIndex="0">
+                        <ComboBox x:Name="WritePolicyCombo" Height="28" SelectedIndex="0" SelectionChanged="WritePolicyCombo_SelectionChanged" ToolTip="ライトバックは高速ですが急な電源断に注意（OS終了・アプリ終了時は安全同期します）。ライトスルーは即時HDD書込で最も安全です。">
                           <ComboBoxItem Content="ライトバック (高速)" Tag="WriteBack" />
                           <ComboBoxItem Content="ライトスルー (安全)" Tag="WriteThrough" />
                         </ComboBox>
@@ -329,12 +329,31 @@
                       </StackPanel>
                     </Grid>
 
-                    <TextBlock Text="パフォーマンスモード" FontSize="10" Margin="0,0,0,4" Foreground="#AAA" />
-                    <ComboBox x:Name="PerformanceMode" SelectedIndex="1" Height="28" Margin="0,0,0,10">
-                      <ComboBoxItem Content="効率優先 (SSD摩耗抑制)" />
-                      <ComboBoxItem Content="バランス (標準)" />
-                      <ComboBoxItem Content="パフォーマンス (積極昇格)" />
-                    </ComboBox>
+                    <Grid Margin="0,0,0,10">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="1.15*" />
+                        <ColumnDefinition Width="0.85*" />
+                      </Grid.ColumnDefinitions>
+                      <StackPanel Grid.Column="0" Margin="0,0,5,0">
+                        <TextBlock Text="パフォーマンスモード" FontSize="10" Margin="0,0,0,4" Foreground="#AAA" />
+                        <ComboBox x:Name="PerformanceMode" SelectedIndex="1" Height="28">
+                          <ComboBoxItem Content="効率優先 (SSD摩耗抑制)" />
+                          <ComboBoxItem Content="バランス (標準)" />
+                          <ComboBoxItem Content="パフォーマンス (積極昇格)" />
+                        </ComboBox>
+                      </StackPanel>
+                      <StackPanel Grid.Column="1" Margin="5,0,0,0">
+                        <TextBlock Text="Write-Back 同期間隔" FontSize="10" Margin="0,0,0,4" Foreground="#AAA" />
+                        <ComboBox x:Name="FlushIntervalCombo" SelectedIndex="3" Height="28">
+                          <ComboBoxItem Content="1 秒 (最安全)" Tag="1" />
+                          <ComboBoxItem Content="3 秒" Tag="3" />
+                          <ComboBoxItem Content="5 秒" Tag="5" />
+                          <ComboBoxItem Content="10 秒 (標準)" Tag="10" />
+                          <ComboBoxItem Content="30 秒" Tag="30" />
+                          <ComboBoxItem Content="60 秒 (効率)" Tag="60" />
+                        </ComboBox>
+                      </StackPanel>
+                    </Grid>
 
                     <Rectangle Height="1" Fill="#25252D" Margin="0,0,0,8" />
                     <DockPanel Margin="0,0,0,6">
@@ -442,7 +461,7 @@
     <!-- Footer -->
     <Grid Grid.Row="3" Margin="0,12,0,0">
       <TextBlock Text="安全モード: ユーザーモード 3階層ハイブリッド (既存RAMDisk優先 L1 + 永続L2 SSD + WinFsp)" Foreground="#43E97B" FontSize="10" FontWeight="Bold" />
-      <TextBlock HorizontalAlignment="Right" Text="HyperCache X v2.1.1" Foreground="#555" FontSize="10" />
+      <TextBlock HorizontalAlignment="Right" Text="HyperCache X v2.2.0" Foreground="#555" FontSize="10" />
     </Grid>
   </Grid>
 </Window>

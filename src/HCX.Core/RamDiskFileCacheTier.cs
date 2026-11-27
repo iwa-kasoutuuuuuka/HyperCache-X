@@ -159,7 +159,8 @@ public sealed class RamDiskFileCacheTier : IL1CacheTier
 		long backingSize,
 		long backingTicks,
 		double aiScore,
-		Action<BlockKey, byte[], int>? onEvictDirty = null)
+		Action<BlockKey, byte[], int>? onEvictDirty = null,
+		Action<RamBlockCopy>? onEvictClean = null)
 	{
 		if (!IsEnabled || _handle == null)
 		{
@@ -223,6 +224,10 @@ public sealed class RamDiskFileCacheTier : IL1CacheTier
 					if (victim.IsDirty)
 					{
 						onEvictDirty?.Invoke(victim.Key, oldData, victim.ValidLength);
+					}
+					else
+					{
+						onEvictClean?.Invoke(evicted);
 					}
 				}
 				RemoveEntryLocked(victim, pushFreeSlot: false);

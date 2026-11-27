@@ -34,6 +34,7 @@ public sealed class HybridCacheEngine : IDisposable
 		public double AiScore { get; set; }
 		public bool IsDirty { get; set; }
 		public bool TrySsdDemote { get; set; }
+		public RamBlockCopy? CleanSource { get; init; }
 	}
 
 	private const int MaxCoalescedFlushBlocks = 16; // 1 MB per coalesced write
@@ -51,6 +52,7 @@ public sealed class HybridCacheEngine : IDisposable
 	private readonly ReaderWriterLockSlim[] _fileLockStripes = new ReaderWriterLockSlim[FileLockStripeCount];
 	private readonly ConcurrentDictionary<string, CachedBackingStat> _statCache = new ConcurrentDictionary<string, CachedBackingStat>(StringComparer.OrdinalIgnoreCase);
 	private readonly ConcurrentDictionary<BlockKey, InFlightEvictionEntry> _inFlightEvictions = new ConcurrentDictionary<BlockKey, InFlightEvictionEntry>();
+	private readonly ConcurrentDictionary<BlockKey, RamBlockCopy> _inFlightCleanDemotions = new ConcurrentDictionary<BlockKey, RamBlockCopy>();
 	private readonly long _statTtlStopwatchTicks;
 
 	private CancellationTokenSource? _cts;
@@ -216,6 +218,45 @@ public sealed class HybridCacheEngine : IDisposable
 					_scorer.UpdateTierState(key, CacheTier.None, false);
 				}
 
+				if (!_inFlightCleanDemotions.IsEmpty &&
+				    _inFlightCleanDemotions.TryGetValue(key, out RamBlockCopy? cleanDemote) &&
+				    cleanDemote.BackingFileSize == backingSize &&
+				    cleanDemote.BackingLastWriteUtcTicks == backingTicks)
+				{
+					int available = Math.Max(0, cleanDemote.ValidLength - blockOffset);
+					int copyCount = Math.Min(chunk, available);
+					if (copyCount > 0)
+					{
+						cleanDemote.Data.AsSpan(blockOffset, copyCount).CopyTo(destSlice);
+					}
+					if (copyCount < chunk)
+					{
+						destSlice.Slice(copyCount).Clear();
+					}
+					Interlocked.Increment(ref _ssdHits);
+					_scorer.RecordAccess(key, isWrite: false, nowUtc, CacheTier.SsdL2, updateDirty: false);
+					bytesReadTotal += chunk;
+					continue;
+				}
+
+				if (!_inFlightEvictions.IsEmpty && _inFlightEvictions.TryGetValue(key, out InFlightEvictionEntry? inflight))
+				{
+					int available = Math.Max(0, inflight.ValidLength - blockOffset);
+					int copyCount = Math.Min(chunk, available);
+					if (copyCount > 0)
+					{
+						inflight.Data.AsSpan(blockOffset, copyCount).CopyTo(destSlice);
+					}
+					if (copyCount < chunk)
+					{
+						destSlice.Slice(copyCount).Clear();
+					}
+					Interlocked.Increment(ref _ramHits);
+					_scorer.RecordAccess(key, isWrite: false, nowUtc, CacheTier.SsdL2, updateDirty: true);
+					bytesReadTotal += chunk;
+					continue;
+				}
+
 				ScoreDecision decision = _scorer.RecordAccess(key, isWrite: false, nowUtc);
 				rentedBlockBuf ??= ArrayPool<byte>.Shared.Rent(_blockSize);
 				Array.Clear(rentedBlockBuf, 0, _blockSize);
@@ -244,19 +285,20 @@ public sealed class HybridCacheEngine : IDisposable
 					_scorer.UpdateTierState(key, CacheTier.None, false);
 				}
 
-				if (!_inFlightEvictions.IsEmpty && _inFlightEvictions.TryGetValue(key, out InFlightEvictionEntry? inflight))
+				if (!_inFlightEvictions.IsEmpty && _inFlightEvictions.TryGetValue(key, out InFlightEvictionEntry? lateInflight))
 				{
-					int available = Math.Max(0, inflight.ValidLength - blockOffset);
+					int available = Math.Max(0, lateInflight.ValidLength - blockOffset);
 					int copyCount = Math.Min(chunk, available);
 					if (copyCount > 0)
 					{
-						inflight.Data.AsSpan(blockOffset, copyCount).CopyTo(destSlice);
+						lateInflight.Data.AsSpan(blockOffset, copyCount).CopyTo(destSlice);
 					}
 					if (copyCount < chunk)
 					{
 						destSlice.Slice(copyCount).Clear();
 					}
 					Interlocked.Increment(ref _ramHits);
+					_scorer.RecordAccess(key, isWrite: false, nowUtc, CacheTier.SsdL2, updateDirty: true);
 					bytesReadTotal += chunk;
 					continue;
 				}
@@ -351,11 +393,19 @@ public sealed class HybridCacheEngine : IDisposable
 					if (inRam)
 					{
 						_ssd.Remove(key);
+						if (!_inFlightCleanDemotions.IsEmpty)
+						{
+							_inFlightCleanDemotions.TryRemove(key, out _);
+						}
 						_scorer.UpdateTierState(key, CacheTier.RamL1, false, decision.Score);
 					}
 					else
 					{
 						_ssd.Remove(key);
+						if (!_inFlightCleanDemotions.IsEmpty)
+						{
+							_inFlightCleanDemotions.TryRemove(key, out _);
+						}
 						if (!decision.IsSequentialBypass && (decision.ShouldPromoteToRam || decision.ShouldPromoteToSsd))
 						{
 							rentedWorkBuf ??= ArrayPool<byte>.Shared.Rent(_blockSize);
@@ -400,9 +450,9 @@ public sealed class HybridCacheEngine : IDisposable
 				if (_ram.TryPatchOrGetForWrite(key, blockOffset, patch, backingSize, backingTicks, decision.Score, markDirty: true))
 				{
 					_ssd.Remove(key);
-					if (!_inFlightEvictions.IsEmpty)
+					if (!_inFlightCleanDemotions.IsEmpty)
 					{
-						_inFlightEvictions.TryRemove(key, out _);
+						_inFlightCleanDemotions.TryRemove(key, out _);
 					}
 					_scorer.UpdateTierState(key, CacheTier.RamL1, isDirty: true, decision.Score);
 					totalWritten += chunk;
@@ -413,26 +463,65 @@ public sealed class HybridCacheEngine : IDisposable
 				Array.Clear(rentedWorkBuf, 0, _blockSize);
 				int existingValidLen = 0;
 				bool isPartial = blockOffset > 0 || chunk < _blockSize;
-				InFlightEvictionEntry? staleInflight = null;
-				if (!_inFlightEvictions.IsEmpty)
-				{
-					_inFlightEvictions.TryRemove(key, out staleInflight);
-				}
-
+				bool gotBaseData = false;
 				if (isPartial)
 				{
-					if (_ssd.TryReadFullBlock(key, rentedWorkBuf, backingSize, backingTicks, out SsdBlockMeta? ssdMeta, out _) && ssdMeta != null)
-					{
-						existingValidLen = ssdMeta.ValidLength;
-					}
-					else if (staleInflight != null)
+					if (!_inFlightEvictions.IsEmpty && _inFlightEvictions.TryRemove(key, out InFlightEvictionEntry? staleInflight))
 					{
 						Buffer.BlockCopy(staleInflight.Data, 0, rentedWorkBuf, 0, Math.Min(_blockSize, staleInflight.Data.Length));
 						existingValidLen = staleInflight.ValidLength;
+						gotBaseData = true;
+						_ssd.Remove(key);
 					}
-					else if (exists && blockIndex * _blockSize < backingSize)
+					else if (_ssd.TryReadFullBlock(key, rentedWorkBuf, backingSize, backingTicks, out SsdBlockMeta? ssdMeta, out _) && ssdMeta != null)
+					{
+						existingValidLen = ssdMeta.ValidLength;
+						gotBaseData = true;
+						_ssd.Remove(key);
+						if (!_inFlightEvictions.IsEmpty)
+						{
+							_inFlightEvictions.TryRemove(key, out _);
+						}
+					}
+					else
+					{
+						_ssd.Remove(key);
+						if (!_inFlightEvictions.IsEmpty && _inFlightEvictions.TryRemove(key, out InFlightEvictionEntry? lateInflight))
+						{
+							Buffer.BlockCopy(lateInflight.Data, 0, rentedWorkBuf, 0, Math.Min(_blockSize, lateInflight.Data.Length));
+							existingValidLen = lateInflight.ValidLength;
+							gotBaseData = true;
+						}
+						else if (!_inFlightCleanDemotions.IsEmpty &&
+						         _inFlightCleanDemotions.TryRemove(key, out RamBlockCopy? cleanDemote) &&
+						         cleanDemote.BackingFileSize == backingSize &&
+						         cleanDemote.BackingLastWriteUtcTicks == backingTicks)
+						{
+							Buffer.BlockCopy(cleanDemote.Data, 0, rentedWorkBuf, 0, Math.Min(_blockSize, cleanDemote.Data.Length));
+							existingValidLen = cleanDemote.ValidLength;
+							gotBaseData = true;
+						}
+					}
+
+					if (!gotBaseData && exists && blockIndex * _blockSize < backingSize)
 					{
 						existingValidLen = ReadBackingBlockLocked(fullPath, openBackingStream, blockIndex * _blockSize, rentedWorkBuf.AsSpan(0, _blockSize));
+					}
+					if (!_inFlightCleanDemotions.IsEmpty)
+					{
+						_inFlightCleanDemotions.TryRemove(key, out _);
+					}
+				}
+				else
+				{
+					_ssd.Remove(key);
+					if (!_inFlightEvictions.IsEmpty)
+					{
+						_inFlightEvictions.TryRemove(key, out _);
+					}
+					if (!_inFlightCleanDemotions.IsEmpty)
+					{
+						_inFlightCleanDemotions.TryRemove(key, out _);
 					}
 				}
 
@@ -441,7 +530,6 @@ public sealed class HybridCacheEngine : IDisposable
 
 				if (_ram.IsEnabled)
 				{
-					_ssd.Remove(key);
 					PutInRamWithDemotion(key, rentedWorkBuf, newValidLen, isDirty: true, backingSize, backingTicks, decision.Score, ref deferredFlushes);
 				}
 				else if (_ssd.IsEnabled)
@@ -577,6 +665,16 @@ public sealed class HybridCacheEngine : IDisposable
 					}
 				}
 			}
+			if (!_inFlightCleanDemotions.IsEmpty)
+			{
+				foreach (BlockKey k in _inFlightCleanDemotions.Keys)
+				{
+					if (string.Equals(k.RelativePath, rel, StringComparison.OrdinalIgnoreCase))
+					{
+						_inFlightCleanDemotions.TryRemove(k, out _);
+					}
+				}
+			}
 		}
 		finally
 		{
@@ -594,6 +692,16 @@ public sealed class HybridCacheEngine : IDisposable
 		{
 			_ram.TruncateFile(rel, newSize);
 			_ssd.TruncateFile(rel, newSize);
+			if (!_inFlightCleanDemotions.IsEmpty)
+			{
+				foreach (BlockKey k in _inFlightCleanDemotions.Keys)
+				{
+					if (string.Equals(k.RelativePath, rel, StringComparison.OrdinalIgnoreCase))
+					{
+						_inFlightCleanDemotions.TryRemove(k, out _);
+					}
+				}
+			}
 			if (!_inFlightEvictions.IsEmpty)
 			{
 				long lastValidBlock = newSize <= 0 ? -1 : (newSize - 1) / _blockSize;
@@ -812,6 +920,7 @@ public sealed class HybridCacheEngine : IDisposable
 		PersistMetadata(cleanShutdown: true);
 		_ram.Clear();
 		_inFlightEvictions.Clear();
+		_inFlightCleanDemotions.Clear();
 		_cts?.Dispose();
 		_cts = null;
 		Log($"エンジン停止: {_targetRootFull}");
@@ -833,6 +942,7 @@ public sealed class HybridCacheEngine : IDisposable
 		}
 		_statCache.Clear();
 		_inFlightEvictions.Clear();
+		_inFlightCleanDemotions.Clear();
 	}
 
 	private int DemoteL1ToL2BeforeShutdown()
@@ -1130,7 +1240,8 @@ public sealed class HybridCacheEngine : IDisposable
 				};
 				stagedKey = evKey;
 				_inFlightEvictions[evKey] = staged;
-			});
+			},
+			onEvictClean: _ssd.IsEnabled ? ev => _inFlightCleanDemotions[ev.Key] = ev : null);
 
 		_scorer.UpdateTierState(key, CacheTier.RamL1, isDirty, aiScore);
 
@@ -1149,18 +1260,41 @@ public sealed class HybridCacheEngine : IDisposable
 			}
 			else if (_ssd.IsEnabled)
 			{
-				InFlightEvictionEntry cleanDemote = new InFlightEvictionEntry
+				if (string.Equals(evicted.Key.RelativePath, key.RelativePath, StringComparison.OrdinalIgnoreCase))
 				{
-					Data = evicted.Data,
-					ValidLength = evicted.ValidLength,
-					BackingFileSize = evicted.BackingFileSize,
-					BackingLastWriteUtcTicks = evicted.BackingLastWriteUtcTicks,
-					AiScore = evicted.AiScore,
-					IsDirty = false,
-					TrySsdDemote = true
-				};
-				deferredFlushes ??= new List<(BlockKey, InFlightEvictionEntry)>();
-				deferredFlushes.Add((evicted.Key, cleanDemote));
+					try
+					{
+						PutInSsdWithDeferredFlush(
+							evicted.Key,
+							evicted.Data,
+							evicted.ValidLength,
+							isDirty: false,
+							evicted.BackingFileSize,
+							evicted.BackingLastWriteUtcTicks,
+							evicted.AiScore,
+							ref deferredFlushes);
+					}
+					finally
+					{
+						_inFlightCleanDemotions.TryRemove(new KeyValuePair<BlockKey, RamBlockCopy>(evicted.Key, evicted));
+					}
+				}
+				else
+				{
+					InFlightEvictionEntry cleanDemote = new InFlightEvictionEntry
+					{
+						Data = evicted.Data,
+						ValidLength = evicted.ValidLength,
+						BackingFileSize = evicted.BackingFileSize,
+						BackingLastWriteUtcTicks = evicted.BackingLastWriteUtcTicks,
+						AiScore = evicted.AiScore,
+						IsDirty = false,
+						TrySsdDemote = true,
+						CleanSource = evicted
+					};
+					deferredFlushes ??= new List<(BlockKey, InFlightEvictionEntry)>();
+					deferredFlushes.Add((evicted.Key, cleanDemote));
+				}
 			}
 			else
 			{
@@ -1302,6 +1436,10 @@ public sealed class HybridCacheEngine : IDisposable
 				}
 				finally
 				{
+					if (entry.CleanSource != null)
+					{
+						_inFlightCleanDemotions.TryRemove(new KeyValuePair<BlockKey, RamBlockCopy>(evKey, entry.CleanSource));
+					}
 					evLock.ExitWriteLock();
 				}
 			}
@@ -1367,6 +1505,19 @@ public sealed class HybridCacheEngine : IDisposable
 				if (nextPath != null && _inFlightEvictions.TryRemove(kv.Key, out InFlightEvictionEntry? removed))
 				{
 					_inFlightEvictions[new BlockKey(nextPath, kv.Key.BlockIndex)] = removed;
+				}
+			}
+		}
+
+		if (!_inFlightCleanDemotions.IsEmpty)
+		{
+			string oldPrefix = oldRel.TrimEnd('\\') + "\\";
+			foreach (BlockKey k in _inFlightCleanDemotions.Keys)
+			{
+				if (string.Equals(k.RelativePath, oldRel, StringComparison.OrdinalIgnoreCase) ||
+				    k.RelativePath.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
+				{
+					_inFlightCleanDemotions.TryRemove(k, out _);
 				}
 			}
 		}

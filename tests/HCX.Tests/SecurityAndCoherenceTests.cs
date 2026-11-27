@@ -375,4 +375,126 @@ public sealed class SecurityAndCoherenceTests : IDisposable
 		Assert.True(result.VerifiedIntegrity);
 		Assert.True(result.RamHits > 0);
 	}
+
+	[Fact]
+	public void HcxFileSystem_BlocksDirectoryJunctionEscapingTargetRoot()
+	{
+		string outsideDir = Path.Combine(_tempRoot, "outside_secret_dir");
+		Directory.CreateDirectory(outsideDir);
+		File.WriteAllText(Path.Combine(outsideDir, "secret.txt"), "top-secret-junction");
+
+		string junctionPath = Path.Combine(_targetDir, "escape_junction");
+		var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c mklink /J \"{junctionPath}\" \"{outsideDir}\"")
+		{
+			UseShellExecute = false,
+			CreateNoWindow = true,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true
+		};
+		using (System.Diagnostics.Process? p = System.Diagnostics.Process.Start(psi))
+		{
+			p?.WaitForExit(5000);
+			Assert.True(p != null && p.ExitCode == 0 && Directory.Exists(junctionPath), "Failed to create directory junction for test.");
+		}
+
+		try
+		{
+			using HybridCacheEngine engine = new HybridCacheEngine(new CacheOptions
+			{
+				TargetRootPath = _targetDir,
+				SsdCacheDirectory = _ssdDir,
+				RamCacheSizeBytes = 65536 * 2,
+				SsdCacheSizeBytes = 65536 * 2
+			});
+			HcxFileSystem fs = new HcxFileSystem(engine);
+
+			byte[]? sd = null;
+			IOException exSec = Assert.Throws<IOException>(() =>
+				fs.GetSecurityByName(@"\escape_junction\secret.txt", out _, ref sd!));
+			Assert.Equal(unchecked((int)0x80070005), exSec.HResult);
+
+			IOException exOpen = Assert.Throws<IOException>(() =>
+				fs.Open(@"\escape_junction\secret.txt", 0, 0x80000000, out _, out _, out _, out _));
+			Assert.Equal(unchecked((int)0x80070005), exOpen.HResult);
+		}
+		finally
+		{
+			try
+			{
+				if (Directory.Exists(junctionPath))
+				{
+					Directory.Delete(junctionPath, recursive: false);
+				}
+			}
+			catch
+			{
+			}
+		}
+	}
+
+	[Fact]
+	public void AppSettingsManager_PersistsAndSanitizesMultiSessionAndRamDiskProfiles()
+	{
+		string settingsPath = Path.Combine(_tempRoot, "multi_profiles.json");
+		AppSettings raw = new AppSettings
+		{
+			TargetPath = _targetDir,
+			FlushIntervalSeconds = 0, // below min 1 -> clamped to 1
+			AutoRestoreSession = true,
+			SavedSessions =
+			{
+				new SessionProfile
+				{
+					TargetPath = _targetDir,
+					L1BackendMode = "InProcessRam",
+					RamSizeMb = 2048,
+					SsdRoot = _ssdDir,
+					SsdSizeMb = 4096,
+					WritePolicy = "WriteThrough",
+					MountPoint = "x:",
+					PerformanceModeIndex = 2,
+					FlushIntervalSeconds = 9999 // clamped to 300
+				},
+				new SessionProfile
+				{
+					TargetPath = @"\\.\PhysicalDrive0", // unsafe -> dropped
+					RamSizeMb = 512
+				},
+				new SessionProfile
+				{
+					TargetPath = Path.Combine(_targetDir, ".hcx"), // internal cache -> dropped
+					RamSizeMb = 512
+				}
+			},
+			SavedRamDisks =
+			{
+				new RamDiskProfile
+				{
+					MountPoint = "m:",
+					CapacityMb = 1024,
+					VolumeLabel = "MY\nRAM\tDISK"
+				},
+				new RamDiskProfile
+				{
+					MountPoint = "INVALID", // dropped
+					CapacityMb = 1024
+				}
+			}
+		};
+
+		AppSettingsManager.Save(raw, settingsPath);
+		AppSettings loaded = AppSettingsManager.Load(settingsPath);
+
+		Assert.Equal(1, loaded.FlushIntervalSeconds);
+		Assert.Single(loaded.SavedSessions);
+		Assert.Equal(_targetDir, loaded.SavedSessions[0].TargetPath);
+		Assert.Equal("WriteThrough", loaded.SavedSessions[0].WritePolicy);
+		Assert.Equal("X:", loaded.SavedSessions[0].MountPoint);
+		Assert.Equal(300, loaded.SavedSessions[0].FlushIntervalSeconds);
+
+		Assert.Single(loaded.SavedRamDisks);
+		Assert.Equal("M:", loaded.SavedRamDisks[0].MountPoint);
+		Assert.Equal(1024, loaded.SavedRamDisks[0].CapacityMb);
+		Assert.Equal("MYRAMDISK", loaded.SavedRamDisks[0].VolumeLabel);
+	}
 }

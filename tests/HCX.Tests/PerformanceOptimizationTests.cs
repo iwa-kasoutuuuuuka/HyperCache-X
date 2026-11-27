@@ -80,7 +80,9 @@ public sealed class PerformanceOptimizationTests : IDisposable
 		});
 
 		CacheStatsSnapshot snap = engine.GetStatsSnapshot();
-		Assert.True(snap.RamHits + snap.SsdHits >= 512);
+		Assert.True(
+			snap.RamHits + snap.SsdHits >= 512,
+			$"RamHits={snap.RamHits}, SsdHits={snap.SsdHits}, HddMisses={snap.HddMisses}, Seq={snap.SequentialBypasses}, RamBlocks={snap.RamCachedBlocks}, SsdBlocks={snap.SsdCachedBlocks}");
 	}
 
 	[Fact]

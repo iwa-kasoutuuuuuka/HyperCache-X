@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        Title="HyperCache X v2.2.0 - 3-Tier Hybrid Storage &amp; RAMDisk Engine"
+        Title="HyperCache X v2.3.0 - 3-Tier Hybrid Storage &amp; RAMDisk Engine"
         Height="820"
         Width="1160"
         MinHeight="700"
@@ -461,7 +461,7 @@
     <!-- Footer -->
     <Grid Grid.Row="3" Margin="0,12,0,0">
       <TextBlock Text="安全モード: ユーザーモード 3階層ハイブリッド (既存RAMDisk優先 L1 + 永続L2 SSD + WinFsp)" Foreground="#43E97B" FontSize="10" FontWeight="Bold" />
-      <TextBlock HorizontalAlignment="Right" Text="HyperCache X v2.2.0" Foreground="#555" FontSize="10" />
+      <TextBlock HorizontalAlignment="Right" Text="HyperCache X v2.3.0" Foreground="#555" FontSize="10" />
     </Grid>
   </Grid>
 </Window>

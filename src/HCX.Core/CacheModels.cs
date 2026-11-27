@@ -112,6 +112,8 @@ public sealed class CacheStatsSnapshot
 
 	public long SequentialBypasses { get; init; }
 
+	public long PrefetchedBlocks { get; init; }
+
 	public double HitRatePercent
 	{
 		get
@@ -198,6 +200,8 @@ public sealed class BenchmarkResult
 	public long SsdHits { get; init; }
 
 	public long SequentialBypasses { get; init; }
+
+	public long PrefetchedBlocks { get; init; }
 
 	public bool VerifiedIntegrity { get; init; }
 

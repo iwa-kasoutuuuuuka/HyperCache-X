@@ -35,8 +35,19 @@ public readonly struct RamDiskStats
 	public int DirectoryCount { get; init; }
 }
 
+public sealed class InMemoryNodeHandle
+{
+	internal readonly object NodeRef;
+
+	internal InMemoryNodeHandle(object nodeRef)
+	{
+		NodeRef = nodeRef;
+	}
+}
+
 /// <summary>
-/// Thread-safe, chunked 64 KB page in-memory filesystem store with strict capacity enforcement.
+/// Thread-safe, chunked 64 KB page in-memory filesystem store with strict capacity enforcement,
+/// direct node handles, and per-file DataLock for parallel multi-file I/O.
 /// </summary>
 public sealed class InMemoryVolumeStore
 {
@@ -47,8 +58,10 @@ public sealed class InMemoryVolumeStore
 	private sealed class Node
 	{
 		public ulong Id;
+		public long Generation;
 		public string Name = string.Empty;
 		public bool IsDirectory;
+		public volatile bool Deleted;
 		public uint Attributes;
 		public long CreationUtcTicks;
 		public long LastAccessUtcTicks;
@@ -57,13 +70,22 @@ public sealed class InMemoryVolumeStore
 		public long FileSize;
 		public readonly List<byte[]> Pages = new List<byte[]>();
 		public Dictionary<string, Node>? Children;
+
+		public Node(bool isDirectory, long generation)
+		{
+			IsDirectory = isDirectory;
+			Generation = generation;
+		}
 	}
 
+	private const int DataLockStripeCount = 64;
 	private readonly ReaderWriterLockSlim _lock = new ReaderWriterLockSlim(LockRecursionPolicy.NoRecursion);
+	private readonly ReaderWriterLockSlim[] _dataLockStripes = new ReaderWriterLockSlim[DataLockStripeCount];
 	private readonly long _maxPages;
 	private readonly byte[] _defaultFileSd;
 	private readonly byte[] _defaultDirSd;
 	private Node _root;
+	private long _generation = 1;
 	private ulong _nextNodeId = 1;
 	private long _allocatedPages;
 	private int _fileCount;
@@ -77,6 +99,10 @@ public sealed class InMemoryVolumeStore
 		{
 			throw new ArgumentOutOfRangeException(nameof(capacityBytes), $"Capacity must be at least {PageSize} bytes.");
 		}
+		for (int i = 0; i < DataLockStripeCount; i++)
+		{
+			_dataLockStripes[i] = new ReaderWriterLockSlim(LockRecursionPolicy.NoRecursion);
+		}
 		_maxPages = capacityBytes / PageSize;
 		CapacityBytes = _maxPages * PageSize;
 
@@ -85,12 +111,16 @@ public sealed class InMemoryVolumeStore
 		_root = CreateRootNode();
 	}
 
+	private ReaderWriterLockSlim GetDataLock(Node node) => _dataLockStripes[(int)(node.Id & (DataLockStripeCount - 1))];
+
+	private bool IsNodeLive(Node node) => !node.Deleted && node.Generation == Volatile.Read(ref _generation);
+
 	public RamDiskStats GetStats()
 	{
 		_lock.EnterReadLock();
 		try
 		{
-			long used = _allocatedPages * PageSize;
+			long used = Volatile.Read(ref _allocatedPages) * PageSize;
 			return new RamDiskStats
 			{
 				CapacityBytes = CapacityBytes,
@@ -104,6 +134,58 @@ public sealed class InMemoryVolumeStore
 		{
 			_lock.ExitReadLock();
 		}
+	}
+
+	public bool TryOpenHandle(string path, out InMemoryNodeHandle? handle, out InMemoryFileInfo info)
+	{
+		_lock.EnterReadLock();
+		try
+		{
+			Node? node = ResolveNodeLocked(path);
+			if (node == null)
+			{
+				handle = null;
+				info = default;
+				return false;
+			}
+			handle = new InMemoryNodeHandle(node);
+			info = ReadNodeInfoSafely(node);
+			return true;
+		}
+		finally
+		{
+			_lock.ExitReadLock();
+		}
+	}
+
+	public bool TryGetInfoByHandle(InMemoryNodeHandle handle, out InMemoryFileInfo info)
+	{
+		Node node = (Node)handle.NodeRef;
+		if (!IsNodeLive(node))
+		{
+			info = default;
+			return false;
+		}
+		info = ReadNodeInfoSafely(node);
+		return true;
+	}
+
+	private InMemoryFileInfo ReadNodeInfoSafely(Node node)
+	{
+		if (!node.IsDirectory)
+		{
+			ReaderWriterLockSlim dataLock = GetDataLock(node);
+			dataLock.EnterReadLock();
+			try
+			{
+				return ToFileInfo(node);
+			}
+			finally
+			{
+				dataLock.ExitReadLock();
+			}
+		}
+		return ToFileInfo(node);
 	}
 
 	public bool Exists(string path)
@@ -131,7 +213,7 @@ public sealed class InMemoryVolumeStore
 				securityDescriptor = Array.Empty<byte>();
 				return false;
 			}
-			info = ToFileInfo(node);
+			info = ReadNodeInfoSafely(node);
 			securityDescriptor = (byte[])node.SecurityDescriptor.Clone();
 			return true;
 		}
@@ -142,6 +224,11 @@ public sealed class InMemoryVolumeStore
 	}
 
 	public InMemoryFileInfo CreateEntry(string path, bool isDirectory, uint attributes, byte[]? securityDescriptor, ulong allocationSize)
+	{
+		return CreateEntryWithHandle(path, isDirectory, attributes, securityDescriptor, allocationSize, out _);
+	}
+
+	public InMemoryFileInfo CreateEntryWithHandle(string path, bool isDirectory, uint attributes, byte[]? securityDescriptor, ulong allocationSize, out InMemoryNodeHandle handle)
 	{
 		_lock.EnterWriteLock();
 		try
@@ -173,6 +260,7 @@ public sealed class InMemoryVolumeStore
 				catch (Exception)
 				{
 					ThrowWin32(1338); // ERROR_INVALID_SECURITY_DESCR
+					handle = null!;
 					return default;
 				}
 			}
@@ -181,11 +269,10 @@ public sealed class InMemoryVolumeStore
 				validatedSd = (byte[])(isDirectory ? _defaultDirSd : _defaultFileSd).Clone();
 			}
 
-			Node node = new Node
+			Node node = new Node(isDirectory, Volatile.Read(ref _generation))
 			{
 				Id = _nextNodeId++,
 				Name = name,
-				IsDirectory = isDirectory,
 				Attributes = cleanAttr,
 				CreationUtcTicks = now,
 				LastAccessUtcTicks = now,
@@ -201,11 +288,10 @@ public sealed class InMemoryVolumeStore
 					throw new IOException("RAM disk capacity exceeded.", ErrorDiskFullHResult);
 				}
 				long neededPages = (long)((allocationSize + PageSize - 1) / PageSize);
-				EnsureCapacityForDeltaPagesLocked(neededPages - node.Pages.Count);
+				ReservePagesAtomic(neededPages);
 				while (node.Pages.Count < neededPages)
 				{
 					node.Pages.Add(new byte[PageSize]);
-					_allocatedPages++;
 				}
 			}
 
@@ -214,6 +300,7 @@ public sealed class InMemoryVolumeStore
 			if (isDirectory) _dirCount++;
 			else _fileCount++;
 
+			handle = new InMemoryNodeHandle(node);
 			return ToFileInfo(node);
 		}
 		finally
@@ -224,23 +311,52 @@ public sealed class InMemoryVolumeStore
 
 	public int ReadFile(string path, ulong offset, Span<byte> destination, out bool endOfFile)
 	{
-		endOfFile = false;
+		Node? node;
 		_lock.EnterReadLock();
 		try
 		{
-			Node? node = ResolveNodeLocked(path);
-			if (node == null)
-			{
-				ThrowWin32(2); // ERROR_FILE_NOT_FOUND
-			}
-			if (node!.IsDirectory)
-			{
-				ThrowWin32(5); // ERROR_ACCESS_DENIED
-			}
+			node = ResolveNodeLocked(path);
+		}
+		finally
+		{
+			_lock.ExitReadLock();
+		}
+		if (node == null)
+		{
+			ThrowWin32(2); // ERROR_FILE_NOT_FOUND
+		}
+		return ReadFileFromNode(node!, offset, destination, out endOfFile);
+	}
 
-			if (offset > (ulong)long.MaxValue)
+	public int ReadFileByHandle(InMemoryNodeHandle handle, ulong offset, Span<byte> destination, out bool endOfFile)
+	{
+		Node node = (Node)handle.NodeRef;
+		if (!IsNodeLive(node))
+		{
+			ThrowWin32(2); // ERROR_FILE_NOT_FOUND
+		}
+		return ReadFileFromNode(node, offset, destination, out endOfFile);
+	}
+
+	private int ReadFileFromNode(Node node, ulong offset, Span<byte> destination, out bool endOfFile)
+	{
+		endOfFile = false;
+		if (node.IsDirectory)
+		{
+			ThrowWin32(5); // ERROR_ACCESS_DENIED
+		}
+		if (offset > (ulong)long.MaxValue)
+		{
+			ThrowWin32(87); // ERROR_INVALID_PARAMETER
+		}
+
+		ReaderWriterLockSlim dataLock = GetDataLock(node);
+		dataLock.EnterReadLock();
+		try
+		{
+			if (!IsNodeLive(node))
 			{
-				ThrowWin32(87); // ERROR_INVALID_PARAMETER
+				ThrowWin32(2);
 			}
 			if (offset >= (ulong)node.FileSize)
 			{
@@ -275,28 +391,57 @@ public sealed class InMemoryVolumeStore
 		}
 		finally
 		{
-			_lock.ExitReadLock();
+			dataLock.ExitReadLock();
 		}
 	}
 
 	public InMemoryFileInfo WriteFile(string path, ulong offset, ReadOnlySpan<byte> source, bool writeToEndOfFile, bool constrainedIo, out uint bytesTransferred)
 	{
-		_lock.EnterWriteLock();
+		Node? node;
+		_lock.EnterReadLock();
 		try
 		{
-			Node? node = ResolveNodeLocked(path);
-			if (node == null)
+			node = ResolveNodeLocked(path);
+		}
+		finally
+		{
+			_lock.ExitReadLock();
+		}
+		if (node == null)
+		{
+			ThrowWin32(2);
+		}
+		return WriteFileToNode(node!, offset, source, writeToEndOfFile, constrainedIo, out bytesTransferred);
+	}
+
+	public InMemoryFileInfo WriteFileByHandle(InMemoryNodeHandle handle, ulong offset, ReadOnlySpan<byte> source, bool writeToEndOfFile, bool constrainedIo, out uint bytesTransferred)
+	{
+		Node node = (Node)handle.NodeRef;
+		if (!IsNodeLive(node))
+		{
+			ThrowWin32(2);
+		}
+		return WriteFileToNode(node, offset, source, writeToEndOfFile, constrainedIo, out bytesTransferred);
+	}
+
+	private InMemoryFileInfo WriteFileToNode(Node node, ulong offset, ReadOnlySpan<byte> source, bool writeToEndOfFile, bool constrainedIo, out uint bytesTransferred)
+	{
+		if (node.IsDirectory)
+		{
+			ThrowWin32(5);
+		}
+		if (!writeToEndOfFile && offset > (ulong)long.MaxValue)
+		{
+			ThrowWin32(87); // ERROR_INVALID_PARAMETER
+		}
+
+		ReaderWriterLockSlim dataLock = GetDataLock(node);
+		dataLock.EnterWriteLock();
+		try
+		{
+			if (!IsNodeLive(node))
 			{
 				ThrowWin32(2);
-			}
-			if (node!.IsDirectory)
-			{
-				ThrowWin32(5);
-			}
-
-			if (!writeToEndOfFile && offset > (ulong)long.MaxValue)
-			{
-				ThrowWin32(87); // ERROR_INVALID_PARAMETER
 			}
 			long writeOffset = writeToEndOfFile ? node.FileSize : (long)offset;
 			int length = source.Length;
@@ -332,11 +477,11 @@ public sealed class InMemoryVolumeStore
 			long requiredPages = (newEnd + PageSize - 1) / PageSize;
 			if (requiredPages > node.Pages.Count)
 			{
-				EnsureCapacityForDeltaPagesLocked(requiredPages - node.Pages.Count);
+				long delta = requiredPages - node.Pages.Count;
+				ReservePagesAtomic(delta);
 				while (node.Pages.Count < requiredPages)
 				{
 					node.Pages.Add(new byte[PageSize]);
-					_allocatedPages++;
 				}
 			}
 
@@ -365,7 +510,7 @@ public sealed class InMemoryVolumeStore
 		}
 		finally
 		{
-			_lock.ExitWriteLock();
+			dataLock.ExitWriteLock();
 		}
 	}
 
@@ -384,20 +529,29 @@ public sealed class InMemoryVolumeStore
 			{
 				throw new IOException("RAM disk capacity exceeded.", ErrorDiskFullHResult);
 			}
-			ResizeNodePagesLocked(node!, (long)allocationSize);
-			node!.FileSize = 0;
-			if (replaceAttributes)
+			ReaderWriterLockSlim dataLock = GetDataLock(node!);
+			dataLock.EnterWriteLock();
+			try
 			{
-				node.Attributes = attributes | (uint)FileAttributes.Archive;
+				ResizeNodePagesLocked(node!, (long)allocationSize);
+				node!.FileSize = 0;
+				if (replaceAttributes)
+				{
+					node.Attributes = attributes | (uint)FileAttributes.Archive;
+				}
+				else if (attributes != 0)
+				{
+					node.Attributes |= attributes | (uint)FileAttributes.Archive;
+				}
+				long now = DateTime.UtcNow.ToFileTimeUtc();
+				node.LastWriteUtcTicks = now;
+				node.LastAccessUtcTicks = now;
+				return ToFileInfo(node);
 			}
-			else if (attributes != 0)
+			finally
 			{
-				node.Attributes |= attributes | (uint)FileAttributes.Archive;
+				dataLock.ExitWriteLock();
 			}
-			long now = DateTime.UtcNow.ToFileTimeUtc();
-			node.LastWriteUtcTicks = now;
-			node.LastAccessUtcTicks = now;
-			return ToFileInfo(node);
 		}
 		finally
 		{
@@ -420,28 +574,37 @@ public sealed class InMemoryVolumeStore
 			{
 				ThrowWin32(87);
 			}
-			if (setAllocationSize)
+			ReaderWriterLockSlim dataLock = GetDataLock(node!);
+			dataLock.EnterWriteLock();
+			try
 			{
-				long targetBytes = Math.Max(newSize, node!.FileSize);
-				if (newSize < node.FileSize)
+				if (setAllocationSize)
 				{
-					TrimEndOfFileBytesLocked(node, newSize);
+					long targetBytes = Math.Max(newSize, node!.FileSize);
+					if (newSize < node.FileSize)
+					{
+						TrimEndOfFileBytesLocked(node, newSize);
+						node.FileSize = newSize;
+						targetBytes = newSize;
+					}
+					ResizeNodePagesLocked(node, targetBytes);
+				}
+				else
+				{
+					if (newSize < node!.FileSize)
+					{
+						TrimEndOfFileBytesLocked(node, newSize);
+					}
+					ResizeNodePagesLocked(node, newSize);
 					node.FileSize = newSize;
-					targetBytes = newSize;
 				}
-				ResizeNodePagesLocked(node, targetBytes);
+				node.LastWriteUtcTicks = DateTime.UtcNow.ToFileTimeUtc();
+				return ToFileInfo(node);
 			}
-			else
+			finally
 			{
-				if (newSize < node!.FileSize)
-				{
-					TrimEndOfFileBytesLocked(node, newSize);
-				}
-				ResizeNodePagesLocked(node, newSize);
-				node.FileSize = newSize;
+				dataLock.ExitWriteLock();
 			}
-			node.LastWriteUtcTicks = DateTime.UtcNow.ToFileTimeUtc();
-			return ToFileInfo(node);
 		}
 		finally
 		{
@@ -523,12 +686,24 @@ public sealed class InMemoryVolumeStore
 
 			if (target.IsDirectory)
 			{
+				target.Deleted = true;
 				_dirCount = Math.Max(0, _dirCount - 1);
 			}
 			else
 			{
-				_allocatedPages = Math.Max(0, _allocatedPages - target.Pages.Count);
-				target.Pages.Clear();
+				ReaderWriterLockSlim dataLock = GetDataLock(target);
+				dataLock.EnterWriteLock();
+				try
+				{
+					target.Deleted = true;
+					ReleasePagesAtomic(target.Pages.Count);
+					target.Pages.Clear();
+					target.FileSize = 0;
+				}
+				finally
+				{
+					dataLock.ExitWriteLock();
+				}
 				_fileCount = Math.Max(0, _fileCount - 1);
 			}
 			return true;
@@ -576,12 +751,24 @@ public sealed class InMemoryVolumeStore
 					newParent.Children.Remove(newName);
 					if (existingTarget.IsDirectory)
 					{
+						existingTarget.Deleted = true;
 						_dirCount = Math.Max(0, _dirCount - 1);
 					}
 					else
 					{
-						_allocatedPages = Math.Max(0, _allocatedPages - existingTarget.Pages.Count);
-						existingTarget.Pages.Clear();
+						ReaderWriterLockSlim dataLock = GetDataLock(existingTarget);
+						dataLock.EnterWriteLock();
+						try
+						{
+							existingTarget.Deleted = true;
+							ReleasePagesAtomic(existingTarget.Pages.Count);
+							existingTarget.Pages.Clear();
+							existingTarget.FileSize = 0;
+						}
+						finally
+						{
+							dataLock.ExitWriteLock();
+						}
 						_fileCount = Math.Max(0, _fileCount - 1);
 					}
 				}
@@ -700,8 +887,9 @@ public sealed class InMemoryVolumeStore
 		_lock.EnterWriteLock();
 		try
 		{
+			Interlocked.Increment(ref _generation);
 			_root = CreateRootNode();
-			_allocatedPages = 0;
+			Volatile.Write(ref _allocatedPages, 0);
 			_fileCount = 0;
 			_dirCount = 0;
 		}
@@ -714,11 +902,10 @@ public sealed class InMemoryVolumeStore
 	private Node CreateRootNode()
 	{
 		long now = DateTime.UtcNow.ToFileTimeUtc();
-		return new Node
+		return new Node(isDirectory: true, Volatile.Read(ref _generation))
 		{
 			Id = _nextNodeId++,
 			Name = string.Empty,
-			IsDirectory = true,
 			Attributes = (uint)FileAttributes.Directory,
 			CreationUtcTicks = now,
 			LastAccessUtcTicks = now,
@@ -728,11 +915,41 @@ public sealed class InMemoryVolumeStore
 		};
 	}
 
-	private void EnsureCapacityForDeltaPagesLocked(long deltaPages)
+	private void ReservePagesAtomic(long deltaPages)
 	{
-		if (deltaPages > 0 && _allocatedPages + deltaPages > _maxPages)
+		if (deltaPages <= 0)
 		{
-			throw new IOException("RAM disk capacity exceeded.", ErrorDiskFullHResult);
+			return;
+		}
+		while (true)
+		{
+			long current = Volatile.Read(ref _allocatedPages);
+			long next = current + deltaPages;
+			if (next > _maxPages)
+			{
+				throw new IOException("RAM disk capacity exceeded.", ErrorDiskFullHResult);
+			}
+			if (Interlocked.CompareExchange(ref _allocatedPages, next, current) == current)
+			{
+				return;
+			}
+		}
+	}
+
+	private void ReleasePagesAtomic(long deltaPages)
+	{
+		if (deltaPages <= 0)
+		{
+			return;
+		}
+		while (true)
+		{
+			long current = Volatile.Read(ref _allocatedPages);
+			long next = Math.Max(0, current - deltaPages);
+			if (Interlocked.CompareExchange(ref _allocatedPages, next, current) == current)
+			{
+				return;
+			}
 		}
 	}
 
@@ -741,18 +958,17 @@ public sealed class InMemoryVolumeStore
 		long targetPages = targetBytes <= 0 ? 0 : (targetBytes + PageSize - 1) / PageSize;
 		if (targetPages > node.Pages.Count)
 		{
-			EnsureCapacityForDeltaPagesLocked(targetPages - node.Pages.Count);
+			ReservePagesAtomic(targetPages - node.Pages.Count);
 			while (node.Pages.Count < targetPages)
 			{
 				node.Pages.Add(new byte[PageSize]);
-				_allocatedPages++;
 			}
 		}
 		else if (targetPages < node.Pages.Count)
 		{
 			int toRemove = node.Pages.Count - (int)targetPages;
 			node.Pages.RemoveRange((int)targetPages, toRemove);
-			_allocatedPages = Math.Max(0, _allocatedPages - toRemove);
+			ReleasePagesAtomic(toRemove);
 		}
 	}
 

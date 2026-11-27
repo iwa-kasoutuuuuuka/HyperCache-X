@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
@@ -58,6 +59,8 @@ public sealed class HybridCacheEngine : IDisposable
 	private CancellationTokenSource? _cts;
 	private Task? _flushTask;
 	private Task? _autoSaveTask;
+	private Task? _readAheadTask;
+	private Channel<BlockKey>? _readAheadChannel;
 	private bool _isRunning;
 	private bool _disposed;
 
@@ -66,6 +69,7 @@ public sealed class HybridCacheEngine : IDisposable
 	private long _ramHits;
 	private long _ssdHits;
 	private long _hddMisses;
+	private long _prefetchedBlocks;
 
 	public CacheOptions Options => _options;
 	public string InstanceId => _instanceId;
@@ -73,6 +77,7 @@ public sealed class HybridCacheEngine : IDisposable
 	public string SsdCacheFilePath => _ssd.CacheFilePath;
 	public string MetadataFilePath => _metadata.MetadataPath;
 	public bool IsRunning => _isRunning;
+	public long PrefetchedBlocks => Interlocked.Read(ref _prefetchedBlocks);
 
 	public event Action<string>? OnLog;
 
@@ -149,6 +154,16 @@ public sealed class HybridCacheEngine : IDisposable
 			_isRunning = true;
 			_flushTask = Task.Run(() => FlushLoopAsync(_cts.Token));
 			_autoSaveTask = Task.Run(() => AutoSaveLoopAsync(_cts.Token));
+			if (_options.EnableReadAhead && _options.ReadAheadBlocks > 0 && (_ram.IsEnabled || _ssd.IsEnabled))
+			{
+				_readAheadChannel = Channel.CreateBounded<BlockKey>(new BoundedChannelOptions(32)
+				{
+					FullMode = BoundedChannelFullMode.DropOldest,
+					SingleReader = true,
+					SingleWriter = false
+				});
+				_readAheadTask = Task.Run(() => ReadAheadLoopAsync(_readAheadChannel.Reader, _cts.Token));
+			}
 
 			Log($"エンジン起動: Target={_targetRootFull} | L1={_ram.BackendDescription} ({_options.RamCacheSizeBytes / (1024 * 1024)}MB) | L2 SSD={_options.SsdCacheSizeBytes / (1024 * 1024)}MB | Policy={_options.WritePolicy}");
 			return true;
@@ -209,7 +224,7 @@ public sealed class HybridCacheEngine : IDisposable
 						destSlice.Slice(ramCopied).Clear();
 					}
 					Interlocked.Increment(ref _ramHits);
-					_scorer.RecordAccess(key, isWrite: false, nowUtc, CacheTier.RamL1, ramDirty);
+					_scorer.RecordL1HitLightweight(key, nowUtc, ramDirty);
 					bytesReadTotal += chunk;
 					continue;
 				}
@@ -304,6 +319,27 @@ public sealed class HybridCacheEngine : IDisposable
 				}
 
 				// Tier 3: Backing HDD read
+				int remaining = toRead - bytesReadTotal;
+				if (decision.IsSequentialBypass &&
+				    remaining > chunk &&
+				    exists &&
+				    pos < backingSize &&
+				    _ram.GetTrackedMaxFileSize(rel) == 0 &&
+				    _ssd.GetTrackedMaxFileSize(rel) == 0 &&
+				    GetInFlightMaxFileSize(rel) == 0)
+				{
+					Span<byte> bulkDest = destination.Slice(bytesReadTotal, remaining);
+					int bulkRead = ReadBackingBlockLocked(fullPath, openBackingStream, pos, bulkDest);
+					if (bulkRead < remaining)
+					{
+						bulkDest.Slice(bulkRead).Clear();
+					}
+					int blocksCovered = Math.Max(1, (remaining + _blockSize - 1) / _blockSize);
+					Interlocked.Add(ref _hddMisses, blocksCovered);
+					bytesReadTotal += remaining;
+					break;
+				}
+
 				Array.Clear(rentedBlockBuf, 0, _blockSize);
 				int validLen = 0;
 				if (exists && blockIndex * _blockSize < backingSize)
@@ -322,6 +358,11 @@ public sealed class HybridCacheEngine : IDisposable
 					else if (_ssd.IsEnabled && decision.ShouldPromoteToSsd)
 					{
 						PutInSsdWithDeferredFlush(key, rentedBlockBuf, validLen, isDirty: false, backingSize, backingTicks, decision.Score, ref deferredFlushes);
+					}
+
+					if (_options.EnableReadAhead && decision.SequentialStreak >= 2)
+					{
+						EnqueueReadAhead(rel, blockIndex, backingSize);
 					}
 				}
 
@@ -831,6 +872,7 @@ public sealed class HybridCacheEngine : IDisposable
 			SsdHits = Interlocked.Read(ref _ssdHits),
 			HddMisses = Interlocked.Read(ref _hddMisses),
 			SequentialBypasses = seqBypasses,
+			PrefetchedBlocks = Interlocked.Read(ref _prefetchedBlocks),
 			RamCachedBlocks = ramCount,
 			RamUsedBytes = ramUsed,
 			RamCapacityBytes = _options.RamCacheSizeBytes,
@@ -893,8 +935,9 @@ public sealed class HybridCacheEngine : IDisposable
 		_isRunning = false;
 		try
 		{
+			_readAheadChannel?.Writer.TryComplete();
 			_cts?.Cancel();
-			Task[] waitTasks = new[] { _flushTask, _autoSaveTask }.Where(t => t != null).Cast<Task>().ToArray();
+			Task[] waitTasks = new[] { _flushTask, _autoSaveTask, _readAheadTask }.Where(t => t != null).Cast<Task>().ToArray();
 			if (waitTasks.Length > 0)
 			{
 				Task.WaitAll(waitTasks, TimeSpan.FromSeconds(5));
@@ -1735,6 +1778,129 @@ public sealed class HybridCacheEngine : IDisposable
 			catch
 			{
 			}
+		}
+	}
+
+	private void EnqueueReadAhead(string rel, long currentBlockIndex, long backingSize)
+	{
+		Channel<BlockKey>? ch = _readAheadChannel;
+		if (ch == null || !_isRunning || _disposed)
+		{
+			return;
+		}
+		int count = Math.Clamp(_options.ReadAheadBlocks, 1, 8);
+		for (int i = 1; i <= count; i++)
+		{
+			long nextIdx = currentBlockIndex + i;
+			if (nextIdx * _blockSize >= backingSize)
+			{
+				break;
+			}
+			ch.Writer.TryWrite(new BlockKey(rel, nextIdx));
+		}
+	}
+
+	private async Task ReadAheadLoopAsync(ChannelReader<BlockKey> reader, CancellationToken token)
+	{
+		byte[]? buf = ArrayPool<byte>.Shared.Rent(_blockSize);
+		try
+		{
+			while (await reader.WaitToReadAsync(token).ConfigureAwait(false))
+			{
+				while (reader.TryRead(out BlockKey key))
+				{
+					if (token.IsCancellationRequested || _disposed)
+					{
+						return;
+					}
+					PrefetchSingleBlock(key, buf);
+				}
+			}
+		}
+		catch (OperationCanceledException)
+		{
+		}
+		catch (Exception ex)
+		{
+			Log($"[警告] 先読みワーカーエラー: {ex.Message}");
+		}
+		finally
+		{
+			ArrayPool<byte>.Shared.Return(buf);
+		}
+	}
+
+	private void PrefetchSingleBlock(BlockKey key, byte[] scratchBuf)
+	{
+		string rel = key.RelativePath;
+		string fullPath;
+		try
+		{
+			fullPath = ResolveBackingPath(rel);
+		}
+		catch
+		{
+			return;
+		}
+
+		ReaderWriterLockSlim fileLock = GetFileLock(rel);
+		if (!fileLock.TryEnterReadLock(0))
+		{
+			return;
+		}
+
+		List<(BlockKey Key, InFlightEvictionEntry Entry)>? deferredFlushes = null;
+		try
+		{
+			(bool exists, long backingSize, long backingTicks) = GetBackingInfoFast(rel, fullPath, null);
+			if (!exists || key.BlockIndex * _blockSize >= backingSize)
+			{
+				return;
+			}
+			if (_ram.TryReadSlice(key, 0, Span<byte>.Empty, backingSize, backingTicks, out _, out _, out _))
+			{
+				return;
+			}
+			if (!_inFlightCleanDemotions.IsEmpty && _inFlightCleanDemotions.ContainsKey(key))
+			{
+				return;
+			}
+			if (!_inFlightEvictions.IsEmpty && _inFlightEvictions.ContainsKey(key))
+			{
+				return;
+			}
+			if (_ssd.IsEnabled && _ssd.ContainsFresh(key, backingSize, backingTicks))
+			{
+				return;
+			}
+
+			Array.Clear(scratchBuf, 0, _blockSize);
+			int validLen = ReadBackingBlockLocked(fullPath, null, key.BlockIndex * _blockSize, scratchBuf.AsSpan(0, _blockSize));
+			if (validLen <= 0)
+			{
+				return;
+			}
+
+			if (_ram.IsEnabled && _ram.MaxBlocks >= 8)
+			{
+				PutInRamWithDemotion(key, scratchBuf, validLen, isDirty: false, backingSize, backingTicks, _options.SsdPromoteScore, ref deferredFlushes);
+				Interlocked.Increment(ref _prefetchedBlocks);
+			}
+			else if (_ssd.IsEnabled)
+			{
+				if (PutInSsdWithDeferredFlush(key, scratchBuf, validLen, isDirty: false, backingSize, backingTicks, _options.SsdPromoteScore, ref deferredFlushes))
+				{
+					Interlocked.Increment(ref _prefetchedBlocks);
+				}
+			}
+		}
+		catch
+		{
+		}
+		finally
+		{
+			fileLock.ExitReadLock();
+			DrainDeferredEvictions(deferredFlushes);
 		}
 	}
 

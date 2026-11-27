@@ -42,6 +42,10 @@ public sealed class CacheOptions
 
 	public int SequentialThreshold { get; set; } = 8;
 
+	public bool EnableReadAhead { get; set; } = true;
+
+	public int ReadAheadBlocks { get; set; } = 2;
+
 	public double SsdPromoteScore { get; set; } = 1.2;
 
 	public double RamPromoteScore { get; set; } = 2.0;

@@ -90,7 +90,7 @@ public partial class MainWindow : Window
 			Hide();
 		}
 
-		Log("HyperCache X v2.2.0 起動中 (ディスク情報を非同期読み込みしています)...");
+		Log("HyperCache X v2.3.0 起動中 (ディスク情報を非同期読み込みしています)...");
 		Dispatcher.BeginInvoke(() => _ = InitializeAsync(), DispatcherPriority.Loaded);
 	}
 
@@ -108,7 +108,7 @@ public partial class MainWindow : Window
 		await RefreshDisksAndOptionsAsync();
 
 		ApplySavedSettingsToUi(_settings);
-		Log("HyperCache X v2.2.0 準備完了 (既存RAMDisk優先 L1 + 永続L2 SSD + 内蔵RAMディスク)。");
+		Log("HyperCache X v2.3.0 準備完了 (シャード化L1/L2 + MMF RAMDisk + 非同期先読み)。");
 
 		DiskInfo? preferredRam = DiskUtility.FindPreferredRamDisk(_cachedDisks);
 		if (preferredRam != null)
@@ -203,7 +203,7 @@ public partial class MainWindow : Window
 
 		_notifyIcon.ContextMenuStrip = _trayMenu;
 		_notifyIcon.Visible = true;
-		_notifyIcon.Text = "HyperCache X v2.2.0 - 準備完了";
+		_notifyIcon.Text = "HyperCache X v2.3.0 - 準備完了";
 		_notifyIcon.DoubleClick += (_, _) => ShowWindow();
 		RefreshTrayMenu();
 	}
@@ -1082,6 +1082,7 @@ public partial class MainWindow : Window
 		long usedMb = snapshots.Sum(s => s.RamUsedBytes + s.SsdUsedBytes) / (1024 * 1024);
 		int dirtyBlocks = snapshots.Sum(s => s.DirtyBlocks);
 		long seqBypasses = snapshots.Sum(s => s.SequentialBypasses);
+		long prefetched = snapshots.Sum(s => s.PrefetchedBlocks);
 		double avgAi = snapshots.Average(s => s.AverageAiScore);
 
 		TxtThroughput.Text = $"{mbPerSec:F1} MB/s";
@@ -1091,7 +1092,7 @@ public partial class MainWindow : Window
 		CachedDetailText.Text = $"L1: {ramBlocks:N0} / L2: {ssdBlocks:N0} blk";
 		AiScoreText.Text = $"{avgAi:F2}";
 		DirtyBlocksText.Text = $"Dirty: {dirtyBlocks:N0} blk";
-		SeqBypassText.Text = $"Seq除外: {seqBypasses:N0}";
+		SeqBypassText.Text = $"Seq除外: {seqBypasses:N0} | 先読: {prefetched:N0}";
 
 		double totalReadMb = snapshots.Sum(s => s.TotalReadBytes) / (1024.0 * 1024.0);
 		double totalWriteMb = snapshots.Sum(s => s.TotalWriteBytes) / (1024.0 * 1024.0);
@@ -1126,7 +1127,7 @@ public partial class MainWindow : Window
 
 		if (_notifyIcon != null)
 		{
-			_notifyIcon.Text = $"HCX v2.2.0 - {_sessions.Count}件稼働 (Hit: {hitRate:F1}%)";
+			_notifyIcon.Text = $"HCX v2.3.0 - {_sessions.Count}件稼働 (Hit: {hitRate:F1}%)";
 		}
 		RefreshTrayMenu();
 	}
@@ -1239,7 +1240,7 @@ public partial class MainWindow : Window
 		}
 		if (_notifyIcon != null)
 		{
-			_notifyIcon.Text = "HyperCache X v2.2.0 - 準備完了";
+			_notifyIcon.Text = "HyperCache X v2.3.0 - 準備完了";
 		}
 		Log("すべての仮想ドライブを安全にアンマウントし、HDD 同期を完了しました。");
 	}

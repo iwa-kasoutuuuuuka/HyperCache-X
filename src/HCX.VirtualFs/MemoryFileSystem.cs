@@ -24,11 +24,13 @@ public sealed class MemoryFileSystem : FileSystemBase
 	private sealed class MemDesc
 	{
 		public string Path;
+		public InMemoryNodeHandle? Handle;
 		public List<InMemoryDirectoryEntry>? DirEntries;
 
-		public MemDesc(string path)
+		public MemDesc(string path, InMemoryNodeHandle? handle = null)
 		{
 			Path = path;
+			Handle = handle;
 		}
 	}
 
@@ -113,9 +115,9 @@ public sealed class MemoryFileSystem : FileSystemBase
 		out string normalizedName)
 	{
 		bool isDir = (createOptions & FILE_DIRECTORY_FILE) != 0;
-		InMemoryFileInfo info = _store.CreateEntry(fileName, isDir, fileAttributes, securityDescriptor, allocationSize);
+		InMemoryFileInfo info = _store.CreateEntryWithHandle(fileName, isDir, fileAttributes, securityDescriptor, allocationSize, out InMemoryNodeHandle handle);
 		fileNode = null!;
-		fileDescOut = new MemDesc(fileName);
+		fileDescOut = new MemDesc(fileName, handle);
 		fileInfo = ConvertInfo(info);
 		normalizedName = null!;
 		return STATUS_SUCCESS;
@@ -130,7 +132,7 @@ public sealed class MemoryFileSystem : FileSystemBase
 		out FileInfo fileInfo,
 		out string normalizedName)
 	{
-		if (!_store.TryGetInfo(fileName, out InMemoryFileInfo info, out _))
+		if (!_store.TryOpenHandle(fileName, out InMemoryNodeHandle? handle, out InMemoryFileInfo info))
 		{
 			fileNode = null!;
 			fileDescOut = null!;
@@ -139,7 +141,7 @@ public sealed class MemoryFileSystem : FileSystemBase
 			return STATUS_OBJECT_NAME_NOT_FOUND;
 		}
 		fileNode = null!;
-		fileDescOut = new MemDesc(fileName);
+		fileDescOut = new MemDesc(fileName, handle);
 		fileInfo = ConvertInfo(info);
 		normalizedName = null!;
 		return STATUS_SUCCESS;
@@ -191,7 +193,9 @@ public sealed class MemoryFileSystem : FileSystemBase
 		unsafe
 		{
 			Span<byte> dest = new Span<byte>(buffer.ToPointer(), (int)length);
-			int read = _store.ReadFile(desc.Path, offset, dest, out bool eof);
+			int read = desc.Handle != null
+				? _store.ReadFileByHandle(desc.Handle, offset, dest, out bool eof)
+				: _store.ReadFile(desc.Path, offset, dest, out eof);
 			if (eof)
 			{
 				bytesTransferred = 0;
@@ -225,7 +229,9 @@ public sealed class MemoryFileSystem : FileSystemBase
 		unsafe
 		{
 			ReadOnlySpan<byte> src = new ReadOnlySpan<byte>(buffer.ToPointer(), (int)length);
-			InMemoryFileInfo info = _store.WriteFile(desc.Path, offset, src, writeToEndOfFile, constrainedIo, out bytesTransferred);
+			InMemoryFileInfo info = desc.Handle != null
+				? _store.WriteFileByHandle(desc.Handle, offset, src, writeToEndOfFile, constrainedIo, out bytesTransferred)
+				: _store.WriteFile(desc.Path, offset, src, writeToEndOfFile, constrainedIo, out bytesTransferred);
 			fileInfo = ConvertInfo(info);
 			return STATUS_SUCCESS;
 		}
@@ -239,6 +245,11 @@ public sealed class MemoryFileSystem : FileSystemBase
 			return STATUS_SUCCESS;
 		}
 		MemDesc desc = (MemDesc)fileDescObj;
+		if (desc.Handle != null && _store.TryGetInfoByHandle(desc.Handle, out InMemoryFileInfo fastInfo))
+		{
+			fileInfo = ConvertInfo(fastInfo);
+			return STATUS_SUCCESS;
+		}
 		if (_store.TryGetInfo(desc.Path, out InMemoryFileInfo info, out _))
 		{
 			fileInfo = ConvertInfo(info);
@@ -251,6 +262,11 @@ public sealed class MemoryFileSystem : FileSystemBase
 	public override int GetFileInfo(object fileNode, object fileDescObj, out FileInfo fileInfo)
 	{
 		MemDesc desc = (MemDesc)fileDescObj;
+		if (desc.Handle != null && _store.TryGetInfoByHandle(desc.Handle, out InMemoryFileInfo fastInfo))
+		{
+			fileInfo = ConvertInfo(fastInfo);
+			return STATUS_SUCCESS;
+		}
 		if (!_store.TryGetInfo(desc.Path, out InMemoryFileInfo info, out _))
 		{
 			fileInfo = default;

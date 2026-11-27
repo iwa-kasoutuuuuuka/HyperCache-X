@@ -9,6 +9,8 @@ public readonly struct ScoreDecision
 {
 	public bool IsSequentialBypass { get; init; }
 
+	public int SequentialStreak { get; init; }
+
 	public double Score { get; init; }
 
 	public bool ShouldPromoteToSsd { get; init; }
@@ -54,6 +56,9 @@ public sealed class AiAccessScorer
 	private readonly double _ramPromoteScore;
 	private readonly int _maxBlocksPerStripe;
 	private long _sequentialBypasses;
+	private int _seqTrackedCount;
+	private int _seqPruneInProgress;
+	private int _l1HitSampleCounter;
 
 	public AiAccessScorer(int sequentialThreshold = 8, double ssdPromoteScore = 1.2, double ramPromoteScore = 2.0, int maxTrackedBlocks = 250_000)
 	{
@@ -69,6 +74,45 @@ public sealed class AiAccessScorer
 
 	public int TrackedFileSequenceCount => _seqByFile.Count;
 
+	/// <summary>
+	/// Fast-path sampling recorder for L1 RAM hits: avoids full ConcurrentDictionary + stripe locking on 75% of hits
+	/// since the block is already promoted to L1.
+	/// </summary>
+	public void RecordL1HitLightweight(BlockKey key, DateTime utcNow, bool isDirty)
+	{
+		if ((Interlocked.Increment(ref _l1HitSampleCounter) & 3) != 0)
+		{
+			return;
+		}
+		StripeBucket stripe = GetStripe(key);
+		lock (stripe.Sync)
+		{
+			if (stripe.Blocks.TryGetValue(key, out BlockHeatState? state))
+			{
+				state.Score = Math.Min(100.0, state.Score + 1.0);
+				state.LastAccessUtc = utcNow;
+				state.HitCount += 4;
+				state.Tier = CacheTier.RamL1;
+				state.IsDirty = isDirty;
+			}
+			else
+			{
+				if (stripe.Blocks.Count >= _maxBlocksPerStripe)
+				{
+					PruneColdEntriesLocked(stripe.Blocks);
+				}
+				stripe.Blocks[key] = new BlockHeatState
+				{
+					Score = _ramPromoteScore,
+					LastAccessUtc = utcNow,
+					HitCount = 4,
+					Tier = CacheTier.RamL1,
+					IsDirty = isDirty
+				};
+			}
+		}
+	}
+
 	public ScoreDecision RecordAccess(
 		BlockKey key,
 		bool isWrite,
@@ -76,12 +120,22 @@ public sealed class AiAccessScorer
 		CacheTier? updateTier = null,
 		bool? updateDirty = null)
 	{
-		if (_seqByFile.Count > MaxTrackedFiles)
+		if (!_seqByFile.TryGetValue(key.RelativePath, out FileSequenceState? seq))
 		{
-			PruneSequenceMap();
+			FileSequenceState created = new FileSequenceState();
+			if (_seqByFile.TryAdd(key.RelativePath, created))
+			{
+				seq = created;
+				if (Interlocked.Increment(ref _seqTrackedCount) > MaxTrackedFiles)
+				{
+					PruneSequenceMap();
+				}
+			}
+			else
+			{
+				seq = _seqByFile.GetOrAdd(key.RelativePath, static _ => new FileSequenceState());
+			}
 		}
-
-		FileSequenceState seq = _seqByFile.GetOrAdd(key.RelativePath, static _ => new FileSequenceState());
 		int currentStreak;
 		bool isSequentialBypass;
 		lock (seq.Sync)
@@ -140,6 +194,7 @@ public sealed class AiAccessScorer
 			return new ScoreDecision
 			{
 				IsSequentialBypass = isSequentialBypass,
+				SequentialStreak = currentStreak,
 				Score = state.Score,
 				ShouldPromoteToSsd = !isSequentialBypass && state.Score >= _ssdPromoteScore,
 				ShouldPromoteToRam = !isSequentialBypass && state.Score >= _ramPromoteScore
@@ -172,7 +227,10 @@ public sealed class AiAccessScorer
 
 	public void RemoveByFile(string normalizedRelPath)
 	{
-		_seqByFile.TryRemove(normalizedRelPath, out _);
+		if (_seqByFile.TryRemove(normalizedRelPath, out _))
+		{
+			Interlocked.Decrement(ref _seqTrackedCount);
+		}
 		for (int i = 0; i < StripeCount; i++)
 		{
 			StripeBucket stripe = _stripes[i];
@@ -208,7 +266,10 @@ public sealed class AiAccessScorer
 			if (string.Equals(seqKey, oldRelPath, StringComparison.OrdinalIgnoreCase) ||
 			    seqKey.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
 			{
-				_seqByFile.TryRemove(seqKey, out _);
+				if (_seqByFile.TryRemove(seqKey, out _))
+				{
+					Interlocked.Decrement(ref _seqTrackedCount);
+				}
 			}
 		}
 
@@ -325,18 +386,39 @@ public sealed class AiAccessScorer
 
 	private StripeBucket GetStripe(BlockKey key) => _stripes[GetStripeIndex(key)];
 
-	private static int GetStripeIndex(BlockKey key) => (key.GetHashCode() & 0x7FFFFFFF) % StripeCount;
+	private static int GetStripeIndex(BlockKey key) => key.GetHashCode() & (StripeCount - 1);
 
 	private void PruneSequenceMap()
 	{
-		int toRemove = Math.Max(1, _seqByFile.Count - MaxTrackedFiles + MaxTrackedFiles / 4);
-		int removed = 0;
-		foreach (string k in _seqByFile.Keys)
+		if (Interlocked.Exchange(ref _seqPruneInProgress, 1) != 0)
 		{
-			if (_seqByFile.TryRemove(k, out _) && ++removed >= toRemove)
+			return;
+		}
+		try
+		{
+			int current = _seqByFile.Count;
+			Volatile.Write(ref _seqTrackedCount, current);
+			if (current <= MaxTrackedFiles)
 			{
-				break;
+				return;
 			}
+			int toRemove = Math.Max(1, current - MaxTrackedFiles + MaxTrackedFiles / 4);
+			int removed = 0;
+			foreach (string k in _seqByFile.Keys)
+			{
+				if (_seqByFile.TryRemove(k, out _))
+				{
+					Interlocked.Decrement(ref _seqTrackedCount);
+					if (++removed >= toRemove)
+					{
+						break;
+					}
+				}
+			}
+		}
+		finally
+		{
+			Volatile.Write(ref _seqPruneInProgress, 0);
 		}
 	}
 

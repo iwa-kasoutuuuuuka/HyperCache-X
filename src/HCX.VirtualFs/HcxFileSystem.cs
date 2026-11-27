@@ -117,28 +117,26 @@ public sealed class HcxFileSystem : FileSystemBase
 
 	public override int GetSecurityByName(string fileName, out uint fileAttributes, ref byte[] securityDescriptor)
 	{
-		string fullPath = ToFullPath(fileName);
-		if (Directory.Exists(fullPath))
-		{
-			DirectoryInfo di = new DirectoryInfo(fullPath);
-			fileAttributes = (uint)di.Attributes;
-			if (securityDescriptor != null)
-			{
-				securityDescriptor = di.GetAccessControl().GetSecurityDescriptorBinaryForm();
-			}
-			return STATUS_SUCCESS;
-		}
-		if (!File.Exists(fullPath))
+		string fullPath = ToFullPath(fileName, out uint attrs);
+		if (attrs == InvalidFileAttributes)
 		{
 			fileAttributes = 0;
 			return STATUS_OBJECT_NAME_NOT_FOUND;
 		}
 
-		System.IO.FileInfo fi = new System.IO.FileInfo(fullPath);
-		fileAttributes = (uint)fi.Attributes;
+		fileAttributes = attrs;
+		if ((attrs & (uint)FileAttributes.Directory) != 0)
+		{
+			if (securityDescriptor != null)
+			{
+				securityDescriptor = new DirectoryInfo(fullPath).GetAccessControl().GetSecurityDescriptorBinaryForm();
+			}
+			return STATUS_SUCCESS;
+		}
+
 		if (securityDescriptor != null)
 		{
-			securityDescriptor = fi.GetAccessControl().GetSecurityDescriptorBinaryForm();
+			securityDescriptor = new System.IO.FileInfo(fullPath).GetAccessControl().GetSecurityDescriptorBinaryForm();
 		}
 		return STATUS_SUCCESS;
 	}
@@ -217,20 +215,20 @@ public sealed class HcxFileSystem : FileSystemBase
 		try
 		{
 			string rel = ToRelativePath(fileName);
-			string fullPath = ToFullPath(fileName);
+			string fullPath = ToFullPath(fileName, out uint attrs);
 			_engine.InvalidateBackingStatCache(rel);
 
-			if (!Directory.Exists(fullPath))
+			if (attrs == InvalidFileAttributes)
 			{
-				if (!File.Exists(fullPath))
-				{
-					fileNode = null!;
-					fileDescOut = null!;
-					fileInfo = default;
-					normalizedName = null!;
-					return STATUS_OBJECT_NAME_NOT_FOUND;
-				}
+				fileNode = null!;
+				fileDescOut = null!;
+				fileInfo = default;
+				normalizedName = null!;
+				return STATUS_OBJECT_NAME_NOT_FOUND;
+			}
 
+			if ((attrs & (uint)FileAttributes.Directory) == 0)
+			{
 				FileAccess access = MapFileAccess(grantedAccess);
 				FileStream fs;
 				try
@@ -776,10 +774,13 @@ public sealed class HcxFileSystem : FileSystemBase
 		return BlockKey.NormalizeRelativePath(winFspFileName);
 	}
 
-	private string ToFullPath(string winFspFileName)
+	private string ToFullPath(string winFspFileName) => ToFullPath(winFspFileName, out _);
+
+	private string ToFullPath(string winFspFileName, out uint finalAttributes)
 	{
 		if (string.IsNullOrEmpty(winFspFileName))
 		{
+			finalAttributes = GetFileAttributesW(_rootPath);
 			return _rootPath;
 		}
 		if (winFspFileName.IndexOf('\0') >= 0)
@@ -789,6 +790,7 @@ public sealed class HcxFileSystem : FileSystemBase
 		string rel = ToRelativePath(winFspFileName);
 		if (string.IsNullOrEmpty(rel))
 		{
+			finalAttributes = GetFileAttributesW(_rootPath);
 			return _rootPath;
 		}
 
@@ -807,7 +809,7 @@ public sealed class HcxFileSystem : FileSystemBase
 			ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED
 		}
 
-		EnsureNoEscapingReparsePoint(combined, rootWithSep);
+		finalAttributes = EnsureNoEscapingReparsePoint(combined, rootWithSep);
 		return combined;
 	}
 
@@ -818,52 +820,66 @@ public sealed class HcxFileSystem : FileSystemBase
 		       normalizedRel.StartsWith(".hcx_bench_", StringComparison.OrdinalIgnoreCase);
 	}
 
-	private void EnsureNoEscapingReparsePoint(string combinedFullPath, string rootWithSep)
+	private uint EnsureNoEscapingReparsePoint(string combinedFullPath, string rootWithSep)
 	{
 		if (combinedFullPath.Length <= rootWithSep.Length)
 		{
-			return;
+			return GetFileAttributesW(_rootPath);
 		}
 
-		string relPart = combinedFullPath.Substring(rootWithSep.Length);
-		string[] segments = relPart.Split('\\', StringSplitOptions.RemoveEmptyEntries);
-		string current = _rootPath;
+		int rootLen = rootWithSep.Length;
+		int pos = rootLen;
+		int totalLen = combinedFullPath.Length;
+		uint lastAttrs = InvalidFileAttributes;
 
-		foreach (string seg in segments)
+		while (pos < totalLen)
 		{
-			current = Path.Combine(current, seg);
-			bool isDir = Directory.Exists(current);
-			bool isFile = !isDir && File.Exists(current);
-			if (!isDir && !isFile)
+			int nextSep = combinedFullPath.IndexOf('\\', pos);
+			int end = nextSep < 0 ? totalLen : nextSep;
+			if (end > pos)
+			{
+				string current = end == totalLen ? combinedFullPath : combinedFullPath.Substring(0, end);
+				uint attrs = GetFileAttributesW(current);
+				if (attrs == InvalidFileAttributes)
+				{
+					return InvalidFileAttributes;
+				}
+				lastAttrs = attrs;
+
+				if ((attrs & (uint)FileAttributes.ReparsePoint) != 0)
+				{
+					bool isDir = (attrs & (uint)FileAttributes.Directory) != 0;
+					FileSystemInfo? target = isDir
+						? Directory.ResolveLinkTarget(current, returnFinalTarget: true)
+						: File.ResolveLinkTarget(current, returnFinalTarget: true);
+					if (target == null)
+					{
+						ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED
+					}
+
+					string resolvedFull = Path.GetFullPath(target!.FullName).TrimEnd('\\');
+					bool insideRoot = string.Equals(resolvedFull, _rootPath, StringComparison.OrdinalIgnoreCase) ||
+					                  resolvedFull.StartsWith(rootWithSep, StringComparison.OrdinalIgnoreCase);
+					if (!insideRoot)
+					{
+						ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED (reparse target escapes root)
+					}
+
+					string resolvedRel = resolvedFull.Length > rootWithSep.Length ? resolvedFull.Substring(rootWithSep.Length) : string.Empty;
+					if (IsInternalHcxRelativePath(resolvedRel))
+					{
+						ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED
+					}
+				}
+			}
+
+			if (nextSep < 0)
 			{
 				break;
 			}
-
-			if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
-			{
-				FileSystemInfo? target = isDir
-					? Directory.ResolveLinkTarget(current, returnFinalTarget: true)
-					: File.ResolveLinkTarget(current, returnFinalTarget: true);
-				if (target == null)
-				{
-					ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED
-				}
-
-				string resolvedFull = Path.GetFullPath(target!.FullName).TrimEnd('\\');
-				bool insideRoot = string.Equals(resolvedFull, _rootPath, StringComparison.OrdinalIgnoreCase) ||
-				                  resolvedFull.StartsWith(rootWithSep, StringComparison.OrdinalIgnoreCase);
-				if (!insideRoot)
-				{
-					ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED (reparse target escapes root)
-				}
-
-				string resolvedRel = resolvedFull.Length > rootWithSep.Length ? resolvedFull.Substring(rootWithSep.Length) : string.Empty;
-				if (IsInternalHcxRelativePath(resolvedRel))
-				{
-					ThrowIoExceptionWithWin32(5); // ERROR_ACCESS_DENIED
-				}
-			}
+			pos = nextSep + 1;
 		}
+		return lastAttrs;
 	}
 
 	private string ToRelativePathFromFull(string fullPath)
@@ -909,6 +925,11 @@ public sealed class HcxFileSystem : FileSystemBase
 	{
 		public bool DeleteFile;
 	}
+
+	private const uint InvalidFileAttributes = 0xFFFFFFFF;
+
+	[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+	private static extern uint GetFileAttributesW(string lpFileName);
 
 	[DllImport("kernel32.dll", SetLastError = true)]
 	private static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);

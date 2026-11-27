@@ -17,8 +17,8 @@ public sealed class RamBlockCopy
 }
 
 /// <summary>
-/// Thread-safe Tier-1 in-memory 64 KB block cache with ReaderWriterLockSlim parallel reads,
-/// O(1) per-file dirty tracking, and sampled LRU eviction.
+/// Thread-safe Tier-1 in-memory 64 KB block cache with sharded ReaderWriterLockSlim partitions,
+/// low-contention LRU clock, O(1) per-file dirty tracking (fast-zero skip), and sampled LRU eviction.
 /// </summary>
 public sealed class RamCacheTier : IL1CacheTier
 {
@@ -36,22 +36,42 @@ public sealed class RamCacheTier : IL1CacheTier
 		public double AiScore;
 	}
 
-	private readonly ReaderWriterLockSlim _rwLock = new ReaderWriterLockSlim(LockRecursionPolicy.NoRecursion);
-	private readonly Dictionary<BlockKey, Entry> _map = new Dictionary<BlockKey, Entry>();
-	private readonly List<BlockKey> _keys = new List<BlockKey>();
-	private readonly Dictionary<string, HashSet<BlockKey>> _keysByFile = new Dictionary<string, HashSet<BlockKey>>(StringComparer.OrdinalIgnoreCase);
-	private readonly Dictionary<string, Dictionary<long, int>> _dirtyBlocksByFile = new Dictionary<string, Dictionary<long, int>>(StringComparer.OrdinalIgnoreCase);
-	private readonly Dictionary<string, long> _dirtyMaxEndByFile = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+	private sealed class Shard : IDisposable
+	{
+		public readonly ReaderWriterLockSlim RwLock = new ReaderWriterLockSlim(LockRecursionPolicy.NoRecursion);
+		public readonly Dictionary<BlockKey, Entry> Map = new Dictionary<BlockKey, Entry>();
+		public readonly List<BlockKey> Keys = new List<BlockKey>();
+		public readonly Dictionary<string, HashSet<BlockKey>> KeysByFile = new Dictionary<string, HashSet<BlockKey>>(StringComparer.OrdinalIgnoreCase);
+		public readonly Dictionary<string, Dictionary<long, int>> DirtyBlocksByFile = new Dictionary<string, Dictionary<long, int>>(StringComparer.OrdinalIgnoreCase);
+		public readonly Dictionary<string, long> DirtyMaxEndByFile = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+		public readonly int MaxBlocks;
+		public long AccessClock;
+		public int ReadSampleCounter;
+		public int EvictCursor;
+		public int DirtyCount;
 
+		public Shard(int maxBlocks)
+		{
+			MaxBlocks = maxBlocks;
+		}
+
+		public void Dispose()
+		{
+			RwLock.Dispose();
+		}
+	}
+
+	private readonly Shard[] _shards;
+	private readonly int _shardMask;
 	private readonly int _blockSize;
 	private readonly int _maxBlocks;
-	private long _accessClock;
-	private int _evictCursor;
-	private int _dirtyCount;
+	private int _totalBlocks;
+	private int _totalDirtyCount;
 	private bool _disposed;
 
 	public int BlockSize => _blockSize;
 	public int MaxBlocks => _maxBlocks;
+	public int ShardCount => _shards.Length;
 	public bool IsEnabled => _maxBlocks > 0 && !_disposed;
 	public string BackendDescription => IsEnabled ? "In-Process RAM" : "OFF";
 
@@ -59,7 +79,20 @@ public sealed class RamCacheTier : IL1CacheTier
 	{
 		_blockSize = blockSizeBytes;
 		_maxBlocks = capacityBytes <= 0 ? 0 : (int)Math.Min(int.MaxValue, capacityBytes / blockSizeBytes);
+
+		int shardCount = _maxBlocks >= 64 ? 16 : (_maxBlocks >= 16 ? 4 : 1);
+		_shards = new Shard[shardCount];
+		_shardMask = shardCount - 1;
+
+		int basePerShard = _maxBlocks / shardCount;
+		int remainder = _maxBlocks % shardCount;
+		for (int i = 0; i < shardCount; i++)
+		{
+			_shards[i] = new Shard(basePerShard + (i < remainder ? 1 : 0));
+		}
 	}
+
+	private Shard GetShard(BlockKey key) => _shards[key.GetHashCode() & _shardMask];
 
 	public bool TryReadSlice(
 		BlockKey key,
@@ -79,11 +112,12 @@ public sealed class RamCacheTier : IL1CacheTier
 			return false;
 		}
 
+		Shard shard = GetShard(key);
 		bool needsEvictStale = false;
-		_rwLock.EnterReadLock();
+		shard.RwLock.EnterReadLock();
 		try
 		{
-			if (!_map.TryGetValue(key, out Entry? e))
+			if (!shard.Map.TryGetValue(key, out Entry? e))
 			{
 				return false;
 			}
@@ -94,11 +128,18 @@ public sealed class RamCacheTier : IL1CacheTier
 			}
 			else
 			{
-				long stamp = Interlocked.Increment(ref _accessClock);
-				Volatile.Write(ref e.LastAccessStamp, stamp);
-				Volatile.Write(ref e.LastAccessUtcTicks, DateTime.UtcNow.Ticks);
-				isDirty = e.IsDirty;
+				long currentClock = Volatile.Read(ref shard.AccessClock);
+				if (Volatile.Read(ref e.LastAccessStamp) != currentClock)
+				{
+					long stamp = Interlocked.Increment(ref shard.AccessClock);
+					Volatile.Write(ref e.LastAccessStamp, stamp);
+					if ((unchecked(++shard.ReadSampleCounter) & 15) == 0)
+					{
+						Volatile.Write(ref e.LastAccessUtcTicks, DateTime.UtcNow.Ticks);
+					}
+				}
 
+				isDirty = e.IsDirty;
 				int available = Math.Max(0, e.ValidLength - blockOffset);
 				bytesCopied = Math.Min(destination.Length, available);
 				if (bytesCopied > 0)
@@ -110,25 +151,25 @@ public sealed class RamCacheTier : IL1CacheTier
 		}
 		finally
 		{
-			_rwLock.ExitReadLock();
+			shard.RwLock.ExitReadLock();
 		}
 
 		if (needsEvictStale)
 		{
-			_rwLock.EnterWriteLock();
+			shard.RwLock.EnterWriteLock();
 			try
 			{
-				if (_map.TryGetValue(key, out Entry? stale) &&
+				if (shard.Map.TryGetValue(key, out Entry? stale) &&
 				    !stale.IsDirty &&
 				    (stale.BackingFileSize != currentBackingSize || stale.BackingLastWriteUtcTicks != currentBackingTicks))
 				{
-					RemoveEntryLocked(stale);
+					RemoveEntryLocked(shard, stale);
 					invalidatedStale = true;
 				}
 			}
 			finally
 			{
-				_rwLock.ExitWriteLock();
+				shard.RwLock.ExitWriteLock();
 			}
 		}
 		return false;
@@ -150,13 +191,18 @@ public sealed class RamCacheTier : IL1CacheTier
 			return null;
 		}
 
-		_rwLock.EnterWriteLock();
+		int shardIdx = key.GetHashCode() & _shardMask;
+		Shard shard = _shards[shardIdx];
+		RamBlockCopy? preEvicted = null;
+		bool needCrossShardEvict = false;
+
+		shard.RwLock.EnterWriteLock();
 		try
 		{
-			long stamp = Interlocked.Increment(ref _accessClock);
+			long stamp = Interlocked.Increment(ref shard.AccessClock);
 			long utcTicks = DateTime.UtcNow.Ticks;
 
-			if (_map.TryGetValue(key, out Entry? existing))
+			if (shard.Map.TryGetValue(key, out Entry? existing))
 			{
 				int copyLen = Math.Min(blockData.Length, _blockSize);
 				blockData.Slice(0, copyLen).CopyTo(existing.Data);
@@ -172,67 +218,166 @@ public sealed class RamCacheTier : IL1CacheTier
 				existing.LastAccessStamp = stamp;
 				existing.LastAccessUtcTicks = utcTicks;
 				existing.AiScore = aiScore;
-				UpdateDirtyIndexOnStateChangeLocked(key, wasDirty, isDirty, validLength);
+				UpdateDirtyIndexOnStateChangeLocked(shard, key, wasDirty, isDirty, validLength);
 				return null;
 			}
 
-			RamBlockCopy? evicted = null;
-			if (_map.Count >= _maxBlocks)
+			bool needsEvict = Volatile.Read(ref _totalBlocks) >= _maxBlocks;
+			if (needsEvict && shard.Map.Count == 0 && _shards.Length > 1)
 			{
-				Entry? victim = SelectVictimLocked();
-				if (victim != null)
+				needCrossShardEvict = true;
+			}
+			else
+			{
+				RamBlockCopy? evicted = null;
+				if (needsEvict && shard.Map.Count > 0)
 				{
-					evicted = new RamBlockCopy
-					{
-						Key = victim.Key,
-						Data = victim.Data,
-						ValidLength = victim.ValidLength,
-						IsDirty = victim.IsDirty,
-						BackingFileSize = victim.BackingFileSize,
-						BackingLastWriteUtcTicks = victim.BackingLastWriteUtcTicks,
-						LastAccessUtc = new DateTime(Volatile.Read(ref victim.LastAccessUtcTicks), DateTimeKind.Utc),
-						AiScore = victim.AiScore
-					};
-					if (victim.IsDirty)
-					{
-						onEvictDirty?.Invoke(victim.Key, victim.Data, victim.ValidLength);
-					}
-					else
-					{
-						onEvictClean?.Invoke(evicted);
-					}
-					RemoveEntryLocked(victim);
+					evicted = EvictVictimLocked(shard, onEvictDirty, onEvictClean);
 				}
+				InsertCreatedEntryLocked(shard, key, blockData, validLength, isDirty, backingSize, backingTicks, stamp, utcTicks, aiScore);
+				return evicted;
 			}
-
-			byte[] buffer = new byte[_blockSize];
-			blockData.Slice(0, Math.Min(blockData.Length, _blockSize)).CopyTo(buffer);
-			Entry created = new Entry
-			{
-				Key = key,
-				Data = buffer,
-				KeyIndex = _keys.Count,
-				ValidLength = validLength,
-				IsDirty = isDirty,
-				BackingFileSize = backingSize,
-				BackingLastWriteUtcTicks = backingTicks,
-				LastAccessStamp = stamp,
-				LastAccessUtcTicks = utcTicks,
-				AiScore = aiScore
-			};
-			_keys.Add(key);
-			_map[key] = created;
-			AddFileKeyIndexLocked(key);
-			if (isDirty)
-			{
-				_dirtyCount++;
-				SetDirtyIndexLocked(key, validLength);
-			}
-			return evicted;
 		}
 		finally
 		{
-			_rwLock.ExitWriteLock();
+			shard.RwLock.ExitWriteLock();
+		}
+
+		if (needCrossShardEvict)
+		{
+			preEvicted = EvictFromAnyOtherShard(shardIdx, onEvictDirty, onEvictClean);
+		}
+
+		shard.RwLock.EnterWriteLock();
+		try
+		{
+			long stamp = Interlocked.Increment(ref shard.AccessClock);
+			long utcTicks = DateTime.UtcNow.Ticks;
+			if (shard.Map.TryGetValue(key, out Entry? existing))
+			{
+				int copyLen = Math.Min(blockData.Length, _blockSize);
+				blockData.Slice(0, copyLen).CopyTo(existing.Data);
+				if (validLength < _blockSize)
+				{
+					Array.Clear(existing.Data, validLength, _blockSize - validLength);
+				}
+				bool wasDirty = existing.IsDirty;
+				existing.ValidLength = validLength;
+				existing.IsDirty = isDirty;
+				existing.BackingFileSize = backingSize;
+				existing.BackingLastWriteUtcTicks = backingTicks;
+				existing.LastAccessStamp = stamp;
+				existing.LastAccessUtcTicks = utcTicks;
+				existing.AiScore = aiScore;
+				UpdateDirtyIndexOnStateChangeLocked(shard, key, wasDirty, isDirty, validLength);
+				return preEvicted;
+			}
+			if (preEvicted == null && Volatile.Read(ref _totalBlocks) >= _maxBlocks && shard.Map.Count > 0)
+			{
+				preEvicted = EvictVictimLocked(shard, onEvictDirty, onEvictClean);
+			}
+			InsertCreatedEntryLocked(shard, key, blockData, validLength, isDirty, backingSize, backingTicks, stamp, utcTicks, aiScore);
+			return preEvicted;
+		}
+		finally
+		{
+			shard.RwLock.ExitWriteLock();
+		}
+	}
+
+	private RamBlockCopy? EvictVictimLocked(
+		Shard shard,
+		Action<BlockKey, byte[], int>? onEvictDirty,
+		Action<RamBlockCopy>? onEvictClean)
+	{
+		Entry? victim = SelectVictimLocked(shard);
+		if (victim == null)
+		{
+			return null;
+		}
+		RamBlockCopy evicted = new RamBlockCopy
+		{
+			Key = victim.Key,
+			Data = victim.Data,
+			ValidLength = victim.ValidLength,
+			IsDirty = victim.IsDirty,
+			BackingFileSize = victim.BackingFileSize,
+			BackingLastWriteUtcTicks = victim.BackingLastWriteUtcTicks,
+			LastAccessUtc = new DateTime(Volatile.Read(ref victim.LastAccessUtcTicks), DateTimeKind.Utc),
+			AiScore = victim.AiScore
+		};
+		if (victim.IsDirty)
+		{
+			onEvictDirty?.Invoke(victim.Key, victim.Data, victim.ValidLength);
+		}
+		else
+		{
+			onEvictClean?.Invoke(evicted);
+		}
+		RemoveEntryLocked(shard, victim);
+		return evicted;
+	}
+
+	private RamBlockCopy? EvictFromAnyOtherShard(
+		int excludeShardIdx,
+		Action<BlockKey, byte[], int>? onEvictDirty,
+		Action<RamBlockCopy>? onEvictClean)
+	{
+		for (int offset = 1; offset < _shards.Length; offset++)
+		{
+			Shard candidate = _shards[(excludeShardIdx + offset) & _shardMask];
+			candidate.RwLock.EnterWriteLock();
+			try
+			{
+				if (candidate.Map.Count > 0)
+				{
+					return EvictVictimLocked(candidate, onEvictDirty, onEvictClean);
+				}
+			}
+			finally
+			{
+				candidate.RwLock.ExitWriteLock();
+			}
+		}
+		return null;
+	}
+
+	private void InsertCreatedEntryLocked(
+		Shard shard,
+		BlockKey key,
+		ReadOnlySpan<byte> blockData,
+		int validLength,
+		bool isDirty,
+		long backingSize,
+		long backingTicks,
+		long stamp,
+		long utcTicks,
+		double aiScore)
+	{
+		byte[] buffer = new byte[_blockSize];
+		blockData.Slice(0, Math.Min(blockData.Length, _blockSize)).CopyTo(buffer);
+		Entry created = new Entry
+		{
+			Key = key,
+			Data = buffer,
+			KeyIndex = shard.Keys.Count,
+			ValidLength = validLength,
+			IsDirty = isDirty,
+			BackingFileSize = backingSize,
+			BackingLastWriteUtcTicks = backingTicks,
+			LastAccessStamp = stamp,
+			LastAccessUtcTicks = utcTicks,
+			AiScore = aiScore
+		};
+		shard.Keys.Add(key);
+		shard.Map[key] = created;
+		Interlocked.Increment(ref _totalBlocks);
+		AddFileKeyIndexLocked(shard, key);
+		if (isDirty)
+		{
+			shard.DirtyCount++;
+			Interlocked.Increment(ref _totalDirtyCount);
+			SetDirtyIndexLocked(shard, key, validLength);
 		}
 	}
 
@@ -250,16 +395,17 @@ public sealed class RamCacheTier : IL1CacheTier
 			return false;
 		}
 
-		_rwLock.EnterWriteLock();
+		Shard shard = GetShard(key);
+		shard.RwLock.EnterWriteLock();
 		try
 		{
-			if (!_map.TryGetValue(key, out Entry? e))
+			if (!shard.Map.TryGetValue(key, out Entry? e))
 			{
 				return false;
 			}
 			if (!e.IsDirty && (e.BackingFileSize != backingSize || e.BackingLastWriteUtcTicks != backingTicks))
 			{
-				RemoveEntryLocked(e);
+				RemoveEntryLocked(shard, e);
 				return false;
 			}
 
@@ -279,94 +425,105 @@ public sealed class RamCacheTier : IL1CacheTier
 				e.BackingFileSize = backingSize;
 				e.BackingLastWriteUtcTicks = backingTicks;
 			}
-			UpdateDirtyIndexOnStateChangeLocked(key, wasDirty, e.IsDirty, e.ValidLength);
+			UpdateDirtyIndexOnStateChangeLocked(shard, key, wasDirty, e.IsDirty, e.ValidLength);
 
-			e.LastAccessStamp = Interlocked.Increment(ref _accessClock);
+			e.LastAccessStamp = Interlocked.Increment(ref shard.AccessClock);
 			e.LastAccessUtcTicks = DateTime.UtcNow.Ticks;
 			e.AiScore = aiScore;
 			return true;
 		}
 		finally
 		{
-			_rwLock.ExitWriteLock();
+			shard.RwLock.ExitWriteLock();
 		}
 	}
 
 	public List<RamBlockCopy> SnapshotEntries(string? filterRelativePath = null, bool dirtyOnly = false)
 	{
-		_rwLock.EnterReadLock();
-		try
+		List<RamBlockCopy> result = new List<RamBlockCopy>();
+		if (dirtyOnly && Volatile.Read(ref _totalDirtyCount) <= 0)
 		{
-			List<RamBlockCopy> result = new List<RamBlockCopy>();
-			if (filterRelativePath != null)
+			return result;
+		}
+
+		for (int i = 0; i < _shards.Length; i++)
+		{
+			Shard shard = _shards[i];
+			shard.RwLock.EnterReadLock();
+			try
 			{
-				if (dirtyOnly)
+				if (filterRelativePath != null)
 				{
-					if (_dirtyBlocksByFile.TryGetValue(filterRelativePath, out Dictionary<long, int>? dirtyBlocks))
+					if (dirtyOnly)
 					{
-						foreach (long blockIdx in dirtyBlocks.Keys)
+						if (shard.DirtyBlocksByFile.TryGetValue(filterRelativePath, out Dictionary<long, int>? dirtyBlocks))
 						{
-							if (_map.TryGetValue(new BlockKey(filterRelativePath, blockIdx), out Entry? e) && e.IsDirty)
+							foreach (long blockIdx in dirtyBlocks.Keys)
+							{
+								if (shard.Map.TryGetValue(new BlockKey(filterRelativePath, blockIdx), out Entry? e) && e.IsDirty)
+								{
+									result.Add(CloneEntry(e));
+								}
+							}
+						}
+						continue;
+					}
+
+					if (shard.KeysByFile.TryGetValue(filterRelativePath, out HashSet<BlockKey>? keys))
+					{
+						foreach (BlockKey k in keys)
+						{
+							if (shard.Map.TryGetValue(k, out Entry? e))
 							{
 								result.Add(CloneEntry(e));
 							}
 						}
 					}
-					return result;
+					continue;
 				}
 
-				if (_keysByFile.TryGetValue(filterRelativePath, out HashSet<BlockKey>? keys))
+				if (dirtyOnly)
 				{
-					foreach (BlockKey k in keys)
+					foreach (KeyValuePair<string, Dictionary<long, int>> fileKv in shard.DirtyBlocksByFile)
 					{
-						if (_map.TryGetValue(k, out Entry? e))
+						foreach (long blockIdx in fileKv.Value.Keys)
 						{
-							result.Add(CloneEntry(e));
+							if (shard.Map.TryGetValue(new BlockKey(fileKv.Key, blockIdx), out Entry? e) && e.IsDirty)
+							{
+								result.Add(CloneEntry(e));
+							}
 						}
 					}
+					continue;
 				}
-				return result;
-			}
 
-			if (dirtyOnly)
-			{
-				foreach (KeyValuePair<string, Dictionary<long, int>> fileKv in _dirtyBlocksByFile)
+				foreach (Entry e in shard.Map.Values)
 				{
-					foreach (long blockIdx in fileKv.Value.Keys)
-					{
-						if (_map.TryGetValue(new BlockKey(fileKv.Key, blockIdx), out Entry? e) && e.IsDirty)
-						{
-							result.Add(CloneEntry(e));
-						}
-					}
+					result.Add(CloneEntry(e));
 				}
-				return result;
 			}
-
-			foreach (Entry e in _map.Values)
+			finally
 			{
-				result.Add(CloneEntry(e));
+				shard.RwLock.ExitReadLock();
 			}
-			return result;
 		}
-		finally
-		{
-			_rwLock.ExitReadLock();
-		}
+		return result;
 	}
 
 	public void MarkClean(BlockKey key, long newBackingSize, long newBackingTicks)
 	{
-		_rwLock.EnterWriteLock();
+		Shard shard = GetShard(key);
+		shard.RwLock.EnterWriteLock();
 		try
 		{
-			if (_map.TryGetValue(key, out Entry? e))
+			if (shard.Map.TryGetValue(key, out Entry? e))
 			{
 				if (e.IsDirty)
 				{
 					e.IsDirty = false;
-					_dirtyCount = Math.Max(0, _dirtyCount - 1);
-					RemoveDirtyIndexLocked(key);
+					shard.DirtyCount = Math.Max(0, shard.DirtyCount - 1);
+					Interlocked.Decrement(ref _totalDirtyCount);
+					RemoveDirtyIndexLocked(shard, key);
 				}
 				e.BackingFileSize = newBackingSize;
 				e.BackingLastWriteUtcTicks = newBackingTicks;
@@ -374,213 +531,303 @@ public sealed class RamCacheTier : IL1CacheTier
 		}
 		finally
 		{
-			_rwLock.ExitWriteLock();
+			shard.RwLock.ExitWriteLock();
 		}
 	}
 
 	public void UpdateBackingMetadataForFile(string normalizedRelPath, long newBackingSize, long newBackingTicks)
 	{
-		_rwLock.EnterWriteLock();
-		try
+		for (int i = 0; i < _shards.Length; i++)
 		{
-			if (_keysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
+			Shard shard = _shards[i];
+			shard.RwLock.EnterWriteLock();
+			try
 			{
-				foreach (BlockKey k in keys)
+				if (shard.KeysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
 				{
-					if (_map.TryGetValue(k, out Entry? e) && !e.IsDirty)
+					foreach (BlockKey k in keys)
 					{
-						e.BackingFileSize = newBackingSize;
-						e.BackingLastWriteUtcTicks = newBackingTicks;
+						if (shard.Map.TryGetValue(k, out Entry? e) && !e.IsDirty)
+						{
+							e.BackingFileSize = newBackingSize;
+							e.BackingLastWriteUtcTicks = newBackingTicks;
+						}
 					}
 				}
 			}
-		}
-		finally
-		{
-			_rwLock.ExitWriteLock();
+			finally
+			{
+				shard.RwLock.ExitWriteLock();
+			}
 		}
 	}
 
 	public void Remove(BlockKey key)
 	{
-		_rwLock.EnterWriteLock();
+		Shard shard = GetShard(key);
+		shard.RwLock.EnterWriteLock();
 		try
 		{
-			if (_map.TryGetValue(key, out Entry? e))
+			if (shard.Map.TryGetValue(key, out Entry? e))
 			{
-				RemoveEntryLocked(e);
+				RemoveEntryLocked(shard, e);
 			}
 		}
 		finally
 		{
-			_rwLock.ExitWriteLock();
+			shard.RwLock.ExitWriteLock();
 		}
 	}
 
 	public void RemoveByFile(string normalizedRelPath)
 	{
-		_rwLock.EnterWriteLock();
-		try
+		for (int i = 0; i < _shards.Length; i++)
 		{
-			if (!_keysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
+			Shard shard = _shards[i];
+			shard.RwLock.EnterWriteLock();
+			try
 			{
-				return;
-			}
-			List<BlockKey> toRemove = new List<BlockKey>(keys);
-			foreach (BlockKey k in toRemove)
-			{
-				if (_map.TryGetValue(k, out Entry? e))
+				if (!shard.KeysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
 				{
-					RemoveEntryLocked(e);
+					continue;
+				}
+				List<BlockKey> toRemove = new List<BlockKey>(keys);
+				foreach (BlockKey k in toRemove)
+				{
+					if (shard.Map.TryGetValue(k, out Entry? e))
+					{
+						RemoveEntryLocked(shard, e);
+					}
 				}
 			}
-		}
-		finally
-		{
-			_rwLock.ExitWriteLock();
+			finally
+			{
+				shard.RwLock.ExitWriteLock();
+			}
 		}
 	}
 
 	public void TruncateFile(string normalizedRelPath, long newSize)
 	{
-		_rwLock.EnterWriteLock();
-		try
+		long lastValidBlock = newSize <= 0 ? -1 : (newSize - 1) / _blockSize;
+		for (int i = 0; i < _shards.Length; i++)
 		{
-			if (!_keysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
+			Shard shard = _shards[i];
+			shard.RwLock.EnterWriteLock();
+			try
 			{
-				return;
-			}
-			long lastValidBlock = newSize <= 0 ? -1 : (newSize - 1) / _blockSize;
-			List<BlockKey> snapshot = new List<BlockKey>(keys);
-			foreach (BlockKey k in snapshot)
-			{
-				if (!_map.TryGetValue(k, out Entry? e))
+				if (!shard.KeysByFile.TryGetValue(normalizedRelPath, out HashSet<BlockKey>? keys))
 				{
 					continue;
 				}
-				if (k.BlockIndex > lastValidBlock)
+				List<BlockKey> snapshot = new List<BlockKey>(keys);
+				foreach (BlockKey k in snapshot)
 				{
-					RemoveEntryLocked(e);
-				}
-				else if (k.BlockIndex == lastValidBlock)
-				{
-					int newValidLen = (int)(newSize - lastValidBlock * _blockSize);
-					if (newValidLen < e.ValidLength)
+					if (!shard.Map.TryGetValue(k, out Entry? e))
 					{
-						Array.Clear(e.Data, newValidLen, e.ValidLength - newValidLen);
-						e.ValidLength = newValidLen;
-						if (e.IsDirty)
+						continue;
+					}
+					if (k.BlockIndex > lastValidBlock)
+					{
+						RemoveEntryLocked(shard, e);
+					}
+					else if (k.BlockIndex == lastValidBlock)
+					{
+						int newValidLen = (int)(newSize - lastValidBlock * _blockSize);
+						if (newValidLen < e.ValidLength)
 						{
-							SetDirtyIndexLocked(k, newValidLen);
+							Array.Clear(e.Data, newValidLen, e.ValidLength - newValidLen);
+							e.ValidLength = newValidLen;
+							if (e.IsDirty)
+							{
+								SetDirtyIndexLocked(shard, k, newValidLen);
+							}
 						}
 					}
 				}
 			}
-		}
-		finally
-		{
-			_rwLock.ExitWriteLock();
+			finally
+			{
+				shard.RwLock.ExitWriteLock();
+			}
 		}
 	}
 
 	public void RenamePrefix(string oldRelPath, string newRelPath)
 	{
-		_rwLock.EnterWriteLock();
-		try
+		string oldPrefix = oldRelPath.TrimEnd('\\') + "\\";
+		List<(Entry Entry, BlockKey NewKey)> crossShardMoves = new List<(Entry, BlockKey)>();
+
+		for (int i = 0; i < _shards.Length; i++)
 		{
-			string oldPrefix = oldRelPath.TrimEnd('\\') + "\\";
-			List<(Entry Entry, BlockKey NewKey)> renames = new List<(Entry, BlockKey)>();
-			foreach (KeyValuePair<string, HashSet<BlockKey>> kv in _keysByFile)
+			Shard shard = _shards[i];
+			shard.RwLock.EnterWriteLock();
+			try
 			{
-				if (string.Equals(kv.Key, oldRelPath, StringComparison.OrdinalIgnoreCase) ||
-				    kv.Key.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
+				List<(Entry Entry, BlockKey NewKey)>? renames = null;
+				foreach (KeyValuePair<string, HashSet<BlockKey>> kv in shard.KeysByFile)
 				{
-					foreach (BlockKey k in kv.Value)
+					if (string.Equals(kv.Key, oldRelPath, StringComparison.OrdinalIgnoreCase) ||
+					    kv.Key.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
 					{
-						if (!_map.TryGetValue(k, out Entry? e))
+						foreach (BlockKey k in kv.Value)
 						{
-							continue;
+							if (!shard.Map.TryGetValue(k, out Entry? e))
+							{
+								continue;
+							}
+							string nextPath = string.Equals(k.RelativePath, oldRelPath, StringComparison.OrdinalIgnoreCase)
+								? newRelPath
+								: newRelPath.TrimEnd('\\') + "\\" + k.RelativePath.Substring(oldPrefix.Length);
+							renames ??= new List<(Entry, BlockKey)>();
+							renames.Add((e, new BlockKey(nextPath, k.BlockIndex)));
 						}
-						string nextPath = string.Equals(k.RelativePath, oldRelPath, StringComparison.OrdinalIgnoreCase)
-							? newRelPath
-							: newRelPath.TrimEnd('\\') + "\\" + k.RelativePath.Substring(oldPrefix.Length);
-						renames.Add((e, new BlockKey(nextPath, k.BlockIndex)));
+					}
+				}
+
+				if (renames == null)
+				{
+					continue;
+				}
+
+				foreach ((Entry entry, BlockKey newKey) in renames)
+				{
+					int targetShardIdx = newKey.GetHashCode() & _shardMask;
+					if (targetShardIdx == i)
+					{
+						BlockKey oldKey = entry.Key;
+						bool wasDirty = entry.IsDirty;
+						int validLen = entry.ValidLength;
+						int idx = entry.KeyIndex;
+
+						shard.Map.Remove(oldKey);
+						RemoveFileKeyIndexLocked(shard, oldKey);
+						if (wasDirty)
+						{
+							RemoveDirtyIndexLocked(shard, oldKey);
+						}
+
+						entry.Key = newKey;
+						shard.Keys[idx] = newKey;
+						shard.Map[newKey] = entry;
+						AddFileKeyIndexLocked(shard, newKey);
+						if (wasDirty)
+						{
+							SetDirtyIndexLocked(shard, newKey, validLen);
+						}
+					}
+					else
+					{
+						RemoveEntryLocked(shard, entry);
+						entry.Key = newKey;
+						crossShardMoves.Add((entry, newKey));
 					}
 				}
 			}
-
-			foreach ((Entry entry, BlockKey newKey) in renames)
+			finally
 			{
-				BlockKey oldKey = entry.Key;
-				bool wasDirty = entry.IsDirty;
-				int validLen = entry.ValidLength;
-				int idx = entry.KeyIndex;
-
-				_map.Remove(oldKey);
-				RemoveFileKeyIndexLocked(oldKey);
-				if (wasDirty)
-				{
-					RemoveDirtyIndexLocked(oldKey);
-				}
-
-				entry.Key = newKey;
-				_keys[idx] = newKey;
-				_map[newKey] = entry;
-				AddFileKeyIndexLocked(newKey);
-				if (wasDirty)
-				{
-					SetDirtyIndexLocked(newKey, validLen);
-				}
+				shard.RwLock.ExitWriteLock();
 			}
 		}
-		finally
+
+		foreach ((Entry entry, BlockKey newKey) in crossShardMoves)
 		{
-			_rwLock.ExitWriteLock();
+			Shard targetShard = GetShard(newKey);
+			targetShard.RwLock.EnterWriteLock();
+			try
+			{
+				if (targetShard.Map.TryGetValue(newKey, out Entry? existing))
+				{
+					RemoveEntryLocked(targetShard, existing);
+				}
+				entry.KeyIndex = targetShard.Keys.Count;
+				targetShard.Keys.Add(newKey);
+				targetShard.Map[newKey] = entry;
+				Interlocked.Increment(ref _totalBlocks);
+				AddFileKeyIndexLocked(targetShard, newKey);
+				if (entry.IsDirty)
+				{
+					targetShard.DirtyCount++;
+					Interlocked.Increment(ref _totalDirtyCount);
+					SetDirtyIndexLocked(targetShard, newKey, entry.ValidLength);
+				}
+			}
+			finally
+			{
+				targetShard.RwLock.ExitWriteLock();
+			}
 		}
 	}
 
 	public long GetTrackedMaxFileSize(string normalizedRelPath)
 	{
-		_rwLock.EnterReadLock();
-		try
+		if (Volatile.Read(ref _totalDirtyCount) <= 0)
 		{
-			return _dirtyMaxEndByFile.TryGetValue(normalizedRelPath, out long maxEnd) ? maxEnd : 0L;
+			return 0L;
 		}
-		finally
+		long maxEnd = 0L;
+		for (int i = 0; i < _shards.Length; i++)
 		{
-			_rwLock.ExitReadLock();
+			Shard shard = _shards[i];
+			shard.RwLock.EnterReadLock();
+			try
+			{
+				if (shard.DirtyMaxEndByFile.TryGetValue(normalizedRelPath, out long shardMax) && shardMax > maxEnd)
+				{
+					maxEnd = shardMax;
+				}
+			}
+			finally
+			{
+				shard.RwLock.ExitReadLock();
+			}
 		}
+		return maxEnd;
 	}
 
 	public (int CachedBlocks, long UsedBytes, int DirtyBlocks) GetCounts()
 	{
-		_rwLock.EnterReadLock();
-		try
+		int totalBlocks = 0;
+		int totalDirty = 0;
+		for (int i = 0; i < _shards.Length; i++)
 		{
-			return (_map.Count, (long)_map.Count * _blockSize, _dirtyCount);
+			Shard shard = _shards[i];
+			shard.RwLock.EnterReadLock();
+			try
+			{
+				totalBlocks += shard.Map.Count;
+				totalDirty += shard.DirtyCount;
+			}
+			finally
+			{
+				shard.RwLock.ExitReadLock();
+			}
 		}
-		finally
-		{
-			_rwLock.ExitReadLock();
-		}
+		return (totalBlocks, (long)totalBlocks * _blockSize, totalDirty);
 	}
 
 	public void Clear()
 	{
-		_rwLock.EnterWriteLock();
-		try
+		for (int i = 0; i < _shards.Length; i++)
 		{
-			_map.Clear();
-			_keys.Clear();
-			_keysByFile.Clear();
-			_dirtyBlocksByFile.Clear();
-			_dirtyMaxEndByFile.Clear();
-			_dirtyCount = 0;
+			Shard shard = _shards[i];
+			shard.RwLock.EnterWriteLock();
+			try
+			{
+				shard.Map.Clear();
+				shard.Keys.Clear();
+				shard.KeysByFile.Clear();
+				shard.DirtyBlocksByFile.Clear();
+				shard.DirtyMaxEndByFile.Clear();
+				shard.DirtyCount = 0;
+			}
+			finally
+			{
+				shard.RwLock.ExitWriteLock();
+			}
 		}
-		finally
-		{
-			_rwLock.ExitWriteLock();
-		}
+		Volatile.Write(ref _totalBlocks, 0);
+		Volatile.Write(ref _totalDirtyCount, 0);
 	}
 
 	public void Dispose()
@@ -591,7 +838,10 @@ public sealed class RamCacheTier : IL1CacheTier
 		}
 		_disposed = true;
 		Clear();
-		_rwLock.Dispose();
+		for (int i = 0; i < _shards.Length; i++)
+		{
+			_shards[i].Dispose();
+		}
 	}
 
 	private RamBlockCopy CloneEntry(Entry e)
@@ -611,9 +861,9 @@ public sealed class RamCacheTier : IL1CacheTier
 		};
 	}
 
-	private Entry? SelectVictimLocked()
+	private static Entry? SelectVictimLocked(Shard shard)
 	{
-		int count = _keys.Count;
+		int count = shard.Keys.Count;
 		if (count == 0)
 		{
 			return null;
@@ -624,11 +874,11 @@ public sealed class RamCacheTier : IL1CacheTier
 		Entry? oldest = null;
 		long oldestStamp = long.MaxValue;
 
-		int start = count <= 64 ? 0 : (_evictCursor % count);
+		int start = count <= 64 ? 0 : (shard.EvictCursor % count);
 		for (int i = 0; i < samples; i++)
 		{
 			int idx = (start + i * stride) % count;
-			Entry candidate = _map[_keys[idx]];
+			Entry candidate = shard.Map[shard.Keys[idx]];
 			long stamp = Volatile.Read(ref candidate.LastAccessStamp);
 			if (stamp < oldestStamp)
 			{
@@ -636,95 +886,99 @@ public sealed class RamCacheTier : IL1CacheTier
 				oldest = candidate;
 			}
 		}
-		_evictCursor = (start + 1) % Math.Max(1, count);
+		shard.EvictCursor = (start + 1) % Math.Max(1, count);
 		return oldest;
 	}
 
-	private void RemoveEntryLocked(Entry e)
+	private void RemoveEntryLocked(Shard shard, Entry e)
 	{
 		if (e.IsDirty)
 		{
-			_dirtyCount = Math.Max(0, _dirtyCount - 1);
-			RemoveDirtyIndexLocked(e.Key);
+			shard.DirtyCount = Math.Max(0, shard.DirtyCount - 1);
+			Interlocked.Decrement(ref _totalDirtyCount);
+			RemoveDirtyIndexLocked(shard, e.Key);
 		}
-		_map.Remove(e.Key);
-		RemoveFileKeyIndexLocked(e.Key);
+		shard.Map.Remove(e.Key);
+		Interlocked.Decrement(ref _totalBlocks);
+		RemoveFileKeyIndexLocked(shard, e.Key);
 
 		int idx = e.KeyIndex;
-		int last = _keys.Count - 1;
+		int last = shard.Keys.Count - 1;
 		if (idx < last)
 		{
-			BlockKey movedKey = _keys[last];
-			_keys[idx] = movedKey;
-			_map[movedKey].KeyIndex = idx;
+			BlockKey movedKey = shard.Keys[last];
+			shard.Keys[idx] = movedKey;
+			shard.Map[movedKey].KeyIndex = idx;
 		}
-		_keys.RemoveAt(last);
+		shard.Keys.RemoveAt(last);
 	}
 
-	private void AddFileKeyIndexLocked(BlockKey key)
+	private static void AddFileKeyIndexLocked(Shard shard, BlockKey key)
 	{
-		if (!_keysByFile.TryGetValue(key.RelativePath, out HashSet<BlockKey>? set))
+		if (!shard.KeysByFile.TryGetValue(key.RelativePath, out HashSet<BlockKey>? set))
 		{
 			set = new HashSet<BlockKey>();
-			_keysByFile[key.RelativePath] = set;
+			shard.KeysByFile[key.RelativePath] = set;
 		}
 		set.Add(key);
 	}
 
-	private void RemoveFileKeyIndexLocked(BlockKey key)
+	private static void RemoveFileKeyIndexLocked(Shard shard, BlockKey key)
 	{
-		if (_keysByFile.TryGetValue(key.RelativePath, out HashSet<BlockKey>? set))
+		if (shard.KeysByFile.TryGetValue(key.RelativePath, out HashSet<BlockKey>? set))
 		{
 			set.Remove(key);
 			if (set.Count == 0)
 			{
-				_keysByFile.Remove(key.RelativePath);
+				shard.KeysByFile.Remove(key.RelativePath);
 			}
 		}
 	}
 
-	private void UpdateDirtyIndexOnStateChangeLocked(BlockKey key, bool wasDirty, bool isNowDirty, int validLen)
+	private void UpdateDirtyIndexOnStateChangeLocked(Shard shard, BlockKey key, bool wasDirty, bool isNowDirty, int validLen)
 	{
 		if (!wasDirty && isNowDirty)
 		{
-			_dirtyCount++;
-			SetDirtyIndexLocked(key, validLen);
+			shard.DirtyCount++;
+			Interlocked.Increment(ref _totalDirtyCount);
+			SetDirtyIndexLocked(shard, key, validLen);
 		}
 		else if (wasDirty && !isNowDirty)
 		{
-			_dirtyCount = Math.Max(0, _dirtyCount - 1);
-			RemoveDirtyIndexLocked(key);
+			shard.DirtyCount = Math.Max(0, shard.DirtyCount - 1);
+			Interlocked.Decrement(ref _totalDirtyCount);
+			RemoveDirtyIndexLocked(shard, key);
 		}
 		else if (isNowDirty)
 		{
-			SetDirtyIndexLocked(key, validLen);
+			SetDirtyIndexLocked(shard, key, validLen);
 		}
 	}
 
-	private void SetDirtyIndexLocked(BlockKey key, int validLen)
+	private void SetDirtyIndexLocked(Shard shard, BlockKey key, int validLen)
 	{
-		if (!_dirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map))
+		if (!shard.DirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map))
 		{
 			map = new Dictionary<long, int>();
-			_dirtyBlocksByFile[key.RelativePath] = map;
+			shard.DirtyBlocksByFile[key.RelativePath] = map;
 		}
 		bool hadPrev = map.TryGetValue(key.BlockIndex, out int prevValidLen);
 		long prevEnd = hadPrev ? key.BlockIndex * _blockSize + prevValidLen : -1L;
 		map[key.BlockIndex] = validLen;
 		long end = key.BlockIndex * _blockSize + validLen;
-		if (!_dirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) || end > curMax)
+		if (!shard.DirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) || end > curMax)
 		{
-			_dirtyMaxEndByFile[key.RelativePath] = end;
+			shard.DirtyMaxEndByFile[key.RelativePath] = end;
 		}
 		else if (hadPrev && prevEnd >= curMax && end < prevEnd)
 		{
-			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
+			RecomputeDirtyMaxEndLocked(shard, key.RelativePath, map);
 		}
 	}
 
-	private void RemoveDirtyIndexLocked(BlockKey key)
+	private void RemoveDirtyIndexLocked(Shard shard, BlockKey key)
 	{
-		if (!_dirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map))
+		if (!shard.DirtyBlocksByFile.TryGetValue(key.RelativePath, out Dictionary<long, int>? map))
 		{
 			return;
 		}
@@ -734,17 +988,17 @@ public sealed class RamCacheTier : IL1CacheTier
 		}
 		if (map.Count == 0)
 		{
-			_dirtyBlocksByFile.Remove(key.RelativePath);
-			_dirtyMaxEndByFile.Remove(key.RelativePath);
+			shard.DirtyBlocksByFile.Remove(key.RelativePath);
+			shard.DirtyMaxEndByFile.Remove(key.RelativePath);
 		}
-		else if (_dirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) &&
+		else if (shard.DirtyMaxEndByFile.TryGetValue(key.RelativePath, out long curMax) &&
 		         key.BlockIndex * _blockSize + removedValidLen >= curMax)
 		{
-			RecomputeDirtyMaxEndLocked(key.RelativePath, map);
+			RecomputeDirtyMaxEndLocked(shard, key.RelativePath, map);
 		}
 	}
 
-	private void RecomputeDirtyMaxEndLocked(string relPath, Dictionary<long, int> map)
+	private void RecomputeDirtyMaxEndLocked(Shard shard, string relPath, Dictionary<long, int> map)
 	{
 		long max = 0;
 		foreach (KeyValuePair<long, int> kv in map)
@@ -755,6 +1009,6 @@ public sealed class RamCacheTier : IL1CacheTier
 				max = end;
 			}
 		}
-		_dirtyMaxEndByFile[relPath] = max;
+		shard.DirtyMaxEndByFile[relPath] = max;
 	}
 }

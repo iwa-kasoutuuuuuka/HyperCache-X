@@ -45,7 +45,8 @@
 - [`src/HCX.Core`](src/HCX.Core/HCX.Core.csproj): 3 階層キャッシュエンジン・設定管理 (`HybridCacheEngine`, `IL1CacheTier`, `RamCacheTier`, `RamDiskFileCacheTier`, `SsdFileCacheTier`, `AiAccessScorer`, `MetadataManager`, `AppSettingsManager`, `DiskUtility`, `CacheBenchmarkRunner`)
 - [`src/HCX.VirtualFs`](src/HCX.VirtualFs/HCX.VirtualFs.csproj): WinFsp 連携仮想ファイルシステム (`HcxFileSystem`, `VirtualDriveHost`, `InMemoryVolumeStore`, `MemoryFileSystem`, `RamDiskHost`, `WinFspRuntime`)
 - [`src/HCX.App`](src/HCX.App/HCX.App.csproj): ダークモード WPF ダッシュボード（ハイブリッド加速 / 内蔵 RAM ディスクの 2 タブ構成、リアルタイム 32×8 ヒートマップ、単一起動制御、複数プロファイル自動復元、先読み・Seq 除外統計表示）
-- [`tests/HCX.Tests`](tests/HCX.Tests/HCX.Tests.csproj): xUnit 自動テストスイート（**57 件**）
+- [`src/HCX.Mcp`](src/HCX.Mcp/HCX.Mcp.csproj): 外部依存ゼロの **MCP (Model Context Protocol) JSON-RPC 2.0 stdio サーバー**（Antigravity / Claude Code 両対応、`HCX.Mcp.exe`）
+- [`tests/HCX.Tests`](tests/HCX.Tests/HCX.Tests.csproj): xUnit 自動テストスイート（**59 件**）
 - [`scripts/build-release.ps1`](scripts/build-release.ps1): テスト＋Self-Contained / Portable デュアル ZIP＋オプション署名＋`SHA256SUMS.txt` 生成スクリプト
 - [`scripts/run-winfsp-e2e.ps1`](scripts/run-winfsp-e2e.ps1): WinFsp 実機マウント E2E 検証スクリプト
 
@@ -54,7 +55,7 @@
 ## ビルド・テスト・配布パッケージ作成 (v2.3.0)
 
 - **ビルド**: `Debug` / `Release` ともに **0 警告 / 0 エラー**
-- **自動テスト**: `dotnet test HCX.sln -c Release --no-build` — **57 / 57 件合格**（16シャード並列、空シャード退避、MMF RAMDisk、非同期先読み、世代ハンドル無効化、ジャンクション越境遮断、実機 `R:\` RAMDisk ベンチマーク等を含む。WinFsp 未導入時は実マウント E2E を安全スキップ）
+- **自動テスト**: `dotnet test HCX.sln -c Release --no-build` — **59 / 59 件合格**（MCP JSON-RPC 2.0 ハンドシェイク・全8ツール、16シャード並列、空シャード退避、MMF RAMDisk、非同期先読み、世代ハンドル無効化、ジャンクション越境遮断、実機 `R:\` RAMDisk ベンチマーク等を含む。WinFsp 未導入時は実マウント E2E を安全スキップ）
 - **依存関係脆弱性**: `dotnet list HCX.sln package --vulnerable --include-transitive` — **0 件**
 
 ### コマンド一覧
@@ -80,3 +81,51 @@ winget install WinFsp.WinFsp
 ```
 
 （または `HCX.App` 画面内の「WinFsp をインストール (winget)」ボタンからも導入できます）
+
+---
+
+## MCP サーバー対応（Antigravity / Claude Code）
+
+HyperCache X には、外部 NuGet 依存ゼロの **MCP (Model Context Protocol) JSON-RPC 2.0 over stdio サーバー**（[`src/HCX.Mcp`](src/HCX.Mcp/HCX.Mcp.csproj) / `HCX.Mcp.exe`）が同梱されています。
+
+### 提供ツール一覧（8 ツール）
+
+| ツール名 | 機能 |
+|---|---|
+| `hcx_get_system_info` | 物理ドライブ、検出 RAMDisk、空きドライブレター、WinFsp 導入状態、設定パスを取得 |
+| `hcx_get_settings` | サニタイズ済みの `settings.json`（保存プロファイル・同期間隔等）を取得 |
+| `hcx_run_benchmark` | 指定フォルダで 3 階層キャッシュ実測ベンチマークを実行し、MB/s・ヒット率・整合性を返却 |
+| `hcx_start_session` | MCP 内で `HybridCacheEngine` セッションを起動（生デバイスパス拒否・最大 8 セッション） |
+| `hcx_get_session_stats` | 稼働セッションのヒット率・L1/L2 ブロック数・先読み数・Dirty 数を取得 |
+| `hcx_sync_session` | Write-Back の Dirty ブロックを `SyncAll()` で即時フラッシュ |
+| `hcx_stop_session` | セッションを安全停止（同期・L1→L2 退避・メタデータ保存） |
+| `hcx_cleanup_cache` | キャッシュフォルダの孤立ファイル（`cache_*.bin`, `l1_cache_*.bin` 等）を安全削除 |
+
+### Claude Code での接続方法
+
+リポジトリ直下に [`.mcp.json`](.mcp.json) を配置済みのため、Claude Code でプロジェクトを開くだけで `hypercache-x` サーバーが自動認識されます。CLI からユーザー設定へ登録する場合は以下を実行してください（ビルド済み exe を使うと起動が高速です）：
+
+```powershell
+# ビルド済み HCX.Mcp.exe を登録（推奨・高速）
+claude mcp add hypercache-x -- "E:\HCX\src\HCX.Mcp\bin\Release\net10.0-windows\HCX.Mcp.exe"
+
+# または dotnet run 経由で登録
+claude mcp add hypercache-x -- dotnet run --project "E:\HCX\src\HCX.Mcp\HCX.Mcp.csproj" -c Release
+```
+
+### Antigravity での接続方法
+
+Antigravity の MCP 設定ファイル（`%USERPROFILE%\.gemini\antigravity\mcp_config.json`）の `mcpServers` に以下を追記してください：
+
+```json
+{
+  "mcpServers": {
+    "hypercache-x": {
+      "command": "E:\\HCX\\src\\HCX.Mcp\\bin\\Release\\net10.0-windows\\HCX.Mcp.exe",
+      "args": []
+    }
+  }
+}
+```
+
+（リリース ZIP 展開先を使う場合は `command` を展開先の `HCX.Mcp.exe` のパスへ置き換えてください）

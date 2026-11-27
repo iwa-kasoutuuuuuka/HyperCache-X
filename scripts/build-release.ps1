@@ -51,8 +51,16 @@ dotnet publish src\HCX.App\HCX.App.csproj `
 	-p:PublishSingleFile=false `
 	-o $SelfDir
 if ($LASTEXITCODE -ne 0) { throw "Self-contained publish failed with exit code $LASTEXITCODE" }
+dotnet publish src\HCX.Mcp\HCX.Mcp.csproj `
+	-c Release `
+	-r $Runtime `
+	--self-contained true `
+	-p:PublishSingleFile=false `
+	-o $SelfDir
+if ($LASTEXITCODE -ne 0) { throw "Self-contained MCP publish failed with exit code $LASTEXITCODE" }
 Copy-Item (Join-Path $RepoRoot "README.md") -Destination (Join-Path $SelfDir "README.md") -Force
 Invoke-CodeSignIfConfigured (Join-Path $SelfDir "HCX.App.exe")
+Invoke-CodeSignIfConfigured (Join-Path $SelfDir "HCX.Mcp.exe")
 
 Write-Host "==> Publishing framework-dependent portable $PortName..." -ForegroundColor Cyan
 dotnet publish src\HCX.App\HCX.App.csproj `
@@ -62,8 +70,16 @@ dotnet publish src\HCX.App\HCX.App.csproj `
 	-p:PublishSingleFile=false `
 	-o $PortDir
 if ($LASTEXITCODE -ne 0) { throw "Portable publish failed with exit code $LASTEXITCODE" }
+dotnet publish src\HCX.Mcp\HCX.Mcp.csproj `
+	-c Release `
+	-r $Runtime `
+	--self-contained false `
+	-p:PublishSingleFile=false `
+	-o $PortDir
+if ($LASTEXITCODE -ne 0) { throw "Portable MCP publish failed with exit code $LASTEXITCODE" }
 Copy-Item (Join-Path $RepoRoot "README.md") -Destination (Join-Path $PortDir "README.md") -Force
 Invoke-CodeSignIfConfigured (Join-Path $PortDir "HCX.App.exe")
+Invoke-CodeSignIfConfigured (Join-Path $PortDir "HCX.Mcp.exe")
 
 if ([string]::IsNullOrWhiteSpace($CertThumbprint)) {
 	Write-Host "==> Notice: CertThumbprint not set; packages are unsigned (pass -CertThumbprint <SHA1> to sign)." -ForegroundColor Yellow

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "hypercache-x": {
+      "command": "dotnet",
+      "args": [
+        "run",
+        "--project",
+        "src/HCX.Mcp/HCX.Mcp.csproj",
+        "-c",
+        "Release"
+      ]
+    }
+  }
+}

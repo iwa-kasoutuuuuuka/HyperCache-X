@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>HCX.Mcp</AssemblyName>
+    <Version>2.3.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\HCX.Core\HCX.Core.csproj" />
+    <ProjectReference Include="..\HCX.VirtualFs\HCX.VirtualFs.csproj" />
+  </ItemGroup>
+</Project>

@@ -18,5 +18,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\HCX.Core\HCX.Core.csproj" />
     <ProjectReference Include="..\..\src\HCX.VirtualFs\HCX.VirtualFs.csproj" />
+    <ProjectReference Include="..\..\src\HCX.Mcp\HCX.Mcp.csproj" />
   </ItemGroup>
 </Project>
